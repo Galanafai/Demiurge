@@ -37,7 +37,7 @@ REPO_URL="https://github.com/Galanafai/Demiurge.git"   # Public HTTPS -- no auth
                                                         # Repo is public; SSH key setup unnecessary
 REPO_BRANCH="week2/model-arch"
 REPO_DIR="/root/Demiurge"
-UV_VERSION="0.4.29"   # Pin uv to a known-good version.
+UV_VERSION="0.6.14"   # Current stable; uses ~/.local/bin (not ~/.cargo/bin).
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,8 +116,8 @@ else
 fi
 
 # Modern astral.sh installer (canonical since uv 0.2+) puts the binary in
-# ~/.local/bin, not ~/.cargo/bin. The cargo path was for older releases.
-export PATH="/root/.local/bin:$PATH"
+# ~/.local/bin. Older versions used ~/.cargo/bin. Export both for safety.
+export PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
 uv --version
 log "uv binary: $(which uv)"
 
