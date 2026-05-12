@@ -16,6 +16,7 @@ import pytest
 
 from scene.schema import WorkspaceBounds
 from tests.validator.fixtures import (
+    make_ik_passes_rrt_blocked,
     make_invalid_ik_blocked,
     make_invalid_interpenetrating,
     make_invalid_unstable,
@@ -149,6 +150,39 @@ class TestInvalidFixtures:
         )
         # When ik fails, rrt must also be False (BiRRT skipped).
         assert not report.rrt_solvable
+
+
+@pytest.mark.slow
+class TestRRTPlantHardening:
+    """Verify that the RRT plant includes welded scene objects.
+
+    This test class validates the two-plant architecture end-to-end:
+      - IK plant (robot-only) succeeds because it cannot see scene objects.
+      - RRT plant (robot + welded scene objects) rejects the IK solution
+        immediately because is_collision_free(q_goal) detects the arm
+        intersecting a welded cube.
+
+    A passing test here proves that _populate_rrt_plant_with_scene is active
+    and that the APPROX annotation has been correctly removed.
+    """
+
+    def test_ik_passes_rrt_blocked_by_scene_object(
+        self, validator: SceneValidator
+    ) -> None:
+        scene = make_ik_passes_rrt_blocked()
+        report = validator.validate(scene, rrt_seed=0)
+
+        assert report.no_interpenetration, (
+            "Single large cube has no collision pairs; no_interpenetration must be True"
+        )
+        assert report.ik_reachable, (
+            f"IK plant is robot-only and must find q_goal; error={report.error}"
+        )
+        assert not report.rrt_solvable, (
+            "RRT plant includes welded cube at IK goal position; "
+            "is_collision_free(q_goal) must return False immediately"
+        )
+        assert not report.accepted
 
 
 # ---------------------------------------------------------------------------

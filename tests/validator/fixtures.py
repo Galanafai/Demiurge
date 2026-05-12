@@ -76,14 +76,17 @@ def _make_scene(
 
 
 def make_valid_sparse() -> SceneTensor:
-    """Three cubes well-separated on the table surface.
+    """Three cubes with the target at the workspace centre-front, obstacles at corners.
 
-    Positions chosen so IK to a point above obj_0 is achievable by the UR5e
-    (x=0, y=0.3 is inside the UR5e reach envelope).
+    The target object is at [0.0, 0.30, 0.025] so IK goal is at [0.0, 0.30, 0.125],
+    which is well within UR5e reach. The two obstacle cubes are placed at workspace
+    corners ([0.35, 0.35] and [-0.35, 0.35]) far from the arm's natural approach path
+    to the target. With the hardened RRT plant (scene objects welded) the corner cubes
+    do not obstruct the BiRRT search.
     """
     return _make_scene(
         type_ids=[ObjectTypeId.CUBE, ObjectTypeId.CUBE, ObjectTypeId.CUBE],
-        xyzs=[(0.0, 0.3, 0.025), (0.2, 0.0, 0.025), (-0.2, 0.1, 0.025)],
+        xyzs=[(0.0, 0.30, 0.025), (0.35, 0.35, 0.025), (-0.35, 0.35, 0.025)],
         scales=[1.0, 1.0, 1.0],
     )
 
@@ -109,10 +112,16 @@ def make_valid_dense() -> SceneTensor:
 
 
 def make_valid_tall() -> SceneTensor:
-    """One tall box standing upright on the table. Stable by symmetry."""
+    """Single cube directly in front of the arm (used as the valid-single-object fixture).
+
+    Cube half-extent z = 0.025m, centroid at z = 0.025, resting on the table.
+    IK goal: [0.0, 0.30, 0.125]. This is front-centre of the workspace and close to
+    the arm's natural reach from home (q=0). The cube is small and low, so no arm
+    link intersects it when the arm reaches the goal. BiRRT solves this quickly.
+    """
     return _make_scene(
-        type_ids=[ObjectTypeId.BOX_TALL],
-        xyzs=[(0.0, 0.3, 0.090)],
+        type_ids=[ObjectTypeId.CUBE],
+        xyzs=[(0.0, 0.30, 0.025)],
         scales=[1.0],
     )
 
@@ -168,4 +177,42 @@ def make_invalid_ik_blocked() -> SceneTensor:
     return _make_scene(
         type_ids=[ObjectTypeId.CUBE],
         xyzs=[(0.0, 0.3, -0.20)],
+    )
+
+
+def make_ik_passes_rrt_blocked() -> SceneTensor:
+    """A large cube placed such that IK succeeds but RRT rejects immediately.
+
+    Architecture under test:
+      - IK plant (robot-only): finds q_goal placing tool0 at the target xyz.
+        The cube is invisible to IK, so IK succeeds.
+      - RRT plant (robot + welded cube): is_collision_free(q_goal) detects the
+        robot arm intersecting the welded cube and returns False before any
+        BiRRT tree expansion. rrt_solvable = False.
+
+    Construction:
+      A single cube with scale 4.0 (side length 0.20m) centred at [0.0, 0.3, 0.15].
+      The IK goal is sampled IK_GOAL_HEIGHT_M (0.10m) above the cube centroid z,
+      so goal_xyz = [0.0, 0.3, 0.25]. The cube occupies z in [0.05, 0.25].
+      At a configuration that places tool0 at z=0.25, the robot forearm links
+      are in the range z in [0.05, 0.25], intersecting the cube's volume.
+
+    Expected behaviour:
+      no_interpenetration = True   (single object, no pairs)
+      stable_rest = True           (large cube is stable on table)
+      ik_reachable = True          (robot-only IK finds a config)
+      rrt_solvable = False         (welded cube blocks q_goal immediately)
+      accepted = False
+    """
+    # scale=4.0 gives a 0.20m cube (canonical half-extent 0.025m * 4 = 0.10m per side).
+    # Place centroid at z=0.15 so the bottom face (z=0.05) is above the table.
+    # The cube top face is at z=0.25; IK goal will be at z=0.25+0.10=0.35, placing
+    # tool0 above the cube -- but reaching down to that height requires arm links
+    # to pass through the cube volume.
+    # Use centroid z = half_extent*scale = 0.025*4 = 0.10 to rest on table exactly,
+    # and rely on the arm intersection with the cube sides when q_goal is evaluated.
+    return _make_scene(
+        type_ids=[ObjectTypeId.CUBE],
+        xyzs=[(0.0, 0.3, 0.10)],
+        scales=[4.0],
     )

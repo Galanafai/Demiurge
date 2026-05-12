@@ -461,14 +461,15 @@ class SceneValidator:
     ) -> bool:
         """Return True if BiRRT finds a path from the home config to q_goal.
 
-        Uses a manual bidirectional RRT. The plant is robot-only.
+        Uses a manual bidirectional RRT. The plant contains the UR5e robot plus
+        all present scene objects welded as static obstacles at their scene poses.
+        Collision queries therefore include robot-vs-object and robot-self pairs.
 
-        # APPROX: scene_object_collision_in_rrt
-        #   The invariant being relaxed: RRT should plan collision-free paths
-        #   through the scene including object geometry. For Week 1 we use a
-        #   robot-only plant and check self-collision only. Scene-object
-        #   collision awareness will be added in Week 2 with a proper
-        #   collision-checker integration.
+        The IK plant (used in _check_ik_reachable) is robot-only and has no
+        knowledge of scene objects. IK can return a q_goal that collides with a
+        scene object. This check catches that case: is_collision_free(q_goal) is
+        evaluated first; if the goal configuration intersects any welded object the
+        check returns False immediately before any tree expansion.
         """
         from pydrake.multibody.plant import AddMultibodyPlantSceneGraph
         from pydrake.systems.framework import DiagramBuilder
@@ -476,6 +477,7 @@ class SceneValidator:
         builder = DiagramBuilder()
         plant, scene_graph = AddMultibodyPlantSceneGraph(builder, time_step=0.0)
         _load_ur5e(plant, self._urdf_path)
+        _populate_rrt_plant_with_scene(plant, scene, self._bounds)
         plant.Finalize()
         _filter_ur5e_self_collisions(plant, scene_graph)
         diagram = builder.Build()
@@ -692,6 +694,73 @@ def _populate_plant_with_scene(
                     body_indices.append(body_idx)
 
     return body_indices
+
+
+def _populate_rrt_plant_with_scene(
+    plant: object,
+    scene: SceneTensor,
+    bounds: WorkspaceBounds,
+) -> None:
+    """Weld all present scene objects into the plant as static obstacles.
+
+    Unlike _populate_plant_with_scene (which sets a floating-body default pose
+    for dynamic simulation), this function welds each object body to the world
+    frame at its scene pose. Welded bodies contribute collision geometry to
+    queries but add no DOF to the joint-space.
+
+    Must be called before plant.Finalize().
+
+    Drake API notes:
+    - Bodies are resolved via plant.GetBodyIndices(model_instance), not
+      GetBodyByName, to avoid ambiguity when multiple objects share the link
+      name 'link'.
+    - WeldFrames uses body.body_frame() as the child frame, not a named link
+      frame, to be safe against SDFs with non-identity inertial origins.
+    - Pre-Finalize, is_floating_base_body() cannot be called. Non-world bodies
+      are identified by excluding plant.world_body().index().
+    """
+    from pydrake.common.eigen_geometry import Quaternion as DrakeQuaternion
+    from pydrake.math import RigidTransform, RotationMatrix
+    from pydrake.multibody.parsing import Parser
+
+    from scene.vocab import build_sdf
+
+    parser = Parser(plant)  # type: ignore[arg-type]
+    world_body_idx = plant.world_body().index()  # type: ignore[attr-defined]
+
+    for i in range(N_MAX):
+        if not scene.presence[i].item():
+            continue
+
+        type_id = int(scene.object_types[i].item())
+        entry = OBJECT_VOCAB[type_id]
+        scale = float(scene.scales[i].mean().item())
+        model_name = f"rrt_obj_{i}_{entry.name}"
+        sdf_str = build_sdf(entry, model_name=model_name, scale=scale)
+
+        xyz = scene.poses[i, 0:3].numpy().astype(float)
+        q_wxyz = scene.poses[i, 3:7].numpy().astype(float)
+        drake_quat = DrakeQuaternion(
+            float(q_wxyz[0]),
+            float(q_wxyz[1]),
+            float(q_wxyz[2]),
+            float(q_wxyz[3]),
+        )
+        X_WB = RigidTransform(RotationMatrix(drake_quat), xyz)
+
+        model_instances = parser.AddModelsFromString(sdf_str, "sdf")
+        for mi in model_instances:
+            for body_idx in plant.GetBodyIndices(mi):  # type: ignore[attr-defined]
+                if body_idx == world_body_idx:
+                    continue
+                body = plant.get_body(body_idx)  # type: ignore[attr-defined]
+                # Weld via body.body_frame(), not GetFrameByName, to handle any
+                # SDF where the link frame and body frame differ.
+                plant.WeldFrames(  # type: ignore[attr-defined]
+                    plant.world_frame(),  # type: ignore[attr-defined]
+                    body.body_frame(),
+                    X_WB,
+                )
 
 
 def _goal_pose_above_scene(scene: SceneTensor) -> np.ndarray:
