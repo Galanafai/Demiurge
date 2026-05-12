@@ -1,13 +1,13 @@
 # Cloud Run: Demiurge 50k Dataset Generation
 
-**Target instance:** Hetzner CCX43 (16 dedicated AMD cores, 64 GB RAM, NVMe SSD, ~$0.21/hr)
-**Fallback:** Hetzner CCX33 (8 dedicated AMD cores, 32 GB RAM) if CCX43 is unavailable
-**OS:** Ubuntu 24.04 LTS (Hetzner image)
-**Expected runtime:** ~8.1h (2s RRT budget, 15 workers, 9.8% acceptance rate)
-**Estimated cost:** ~$1.70-3.50 total (8-17h including setup and teardown)
+**Primary provider:** RunPod CPU pod
+**Fallback:** Hetzner CCX43 / CCX33 (see Appendix)
+**OS:** Ubuntu 24.04 (select during pod creation)
+**Expected runtime:** ~8.1h (2s RRT budget, 15 workers on 16 vCPU pod)
+**Estimated cost:** <$5 total at RunPod per-minute CPU rates
 
 > [!IMPORTANT]
-> Do not provision the instance until the re-profile results in `artifacts/validator_profile.md`
+> Do not provision the pod until the re-profile results in `artifacts/validator_profile.md`
 > have been reviewed and the gate override has been explicitly approved.
 > Gate override for the 12-vocab run was approved by Galanafai on 2026-05-12.
 
@@ -15,55 +15,34 @@
 
 ## Prerequisites
 
-- Hetzner Cloud account with billing set up
-- SSH key uploaded to Hetzner Cloud (Settings > SSH Keys)
-- `hcloud` CLI installed locally (optional; web UI path is the default below)
+- RunPod account with billing set up (runpod.io)
+- SSH public key ready to paste during pod creation
 - `rsync` available on your local machine
 
 ---
 
-## Step 1: Provision the Instance
+## Step 1: Provision the RunPod CPU Pod
 
-### Option A: Web UI (recommended for first-time use)
-
-1. Log in to [console.hetzner.cloud](https://console.hetzner.cloud)
-2. Select your project (or create one named `demiurge`)
-3. Click **Add Server**
-4. Configure:
-   - **Location:** Ashburn (ASH, US East) or Hillsboro (HIL, US West -- closer to Oakland).
-     Use EU locations (Falkenstein FSN1, Nuremberg NBG1) only as fallbacks if US capacity
-     is unavailable. EU adds transatlantic rsync time (~30-60 min extra for ~50 GB).
-   - **Image:** Ubuntu 24.04
-   - **Type:** Dedicated vCPU > **CCX43** (16 vCPU, 64 GB, NVMe)
-     - If CCX43 is sold out in your chosen location: try the other US location first,
-       then fall back to **CCX33** (8 vCPU, 32 GB) and reduce `num_workers` to 7
-       in `configs/dataset/v1.yaml`
-   - **SSH Keys:** select your uploaded key
-   - **Name:** `demiurge-gen`
-5. Click **Create & Buy Now**
-6. Wait for the instance to show **Running** (typically <60 seconds)
-7. Note the public IPv4 address
-
-### Option B: hcloud CLI (reproducible / automatable)
-
-```bash
-# Create server (adjust ssh-key-name to match your uploaded key)
-hcloud server create \
-    --name demiurge-gen \
-    --type ccx43 \
-    --image ubuntu-24.04 \
-    --location ash \
-    --ssh-key <your-ssh-key-name>
-
-# Get the IP
-hcloud server describe demiurge-gen | grep "Public Net"
-```
+1. Sign in to [runpod.io](https://www.runpod.io) and click **Pods** in the left sidebar
+2. Click **+ Deploy**
+3. At the top of the deployment page, switch the pod type to **CPU** (not GPU)
+4. Select a **Community Cloud** CPU pod. Look for pods with:
+   - **vCPU count:** 16 vCPU (preferred) or 8 vCPU (fallback)
+   - **RAM:** ~32 GB or more
+   - **Disk:** 50 GB minimum (dataset output will be ~20-30 GB)
+   - **Template:** Ubuntu 22.04 or 24.04 -- select whichever is available;
+     the bootstrap script targets Ubuntu 24.04 but is compatible with 22.04
+5. Under **SSH Terminal Access**, paste your SSH public key
+6. Click **Deploy**
+7. Wait for pod status to show **Running** (typically <60 seconds)
 
 > [!NOTE]
-> CCX43 Hetzner type string is `ccx43`. CCX33 fallback is `ccx33`.
-> US locations: `ash` (Ashburn, VA) and `hil` (Hillsboro, OR).
-> EU fallbacks: `fsn1` (Falkenstein) and `nbg1` (Nuremberg).
-> Run `hcloud server-type list` and `hcloud location list` to confirm availability.
+> If no 16 vCPU CPU pods are available in Community Cloud, use 8 vCPU and
+> update `configs/dataset/v1.yaml`:
+> ```yaml
+> num_workers: 7   # 8 vCPU minus 1 for OS/writer
+> ```
+> The 8 vCPU projection at 2s budget is ~15h -- within the approved 20h gate.
 
 ---
 
@@ -75,41 +54,62 @@ The repository is **public** on GitHub. `cloud_setup.sh` uses HTTPS:
 REPO_URL="https://github.com/Galanafai/Demiurge.git"
 ```
 
-No credentials or SSH keys are needed on the cloud instance. `git clone` and
-`git pull` work without any auth setup.
+No credentials or SSH keys are required on the pod. `git clone` works without
+any auth setup.
 
-**Why not SSH?** SSH requires uploading a deploy key to the instance and registering
-it on GitHub -- an extra provisioning step that can fail silently (wrong permissions,
-`known_hosts` not populated). HTTPS with a public repo is simpler, faster, and has
-no security tradeoff: the repository contains no credentials, private data, or
-instance IPs.
-
-**If the repo is ever made private:** switch `REPO_URL` in `cloud_setup.sh` to
-`git@github.com:Galanafai/Demiurge.git` and add the following before the clone step:
+**If the repo is ever made private:** switch to SSH (`git@github.com:Galanafai/Demiurge.git`)
+and add before the clone step:
 
 ```bash
-# Copy deploy key to instance first:
-# scp ~/.ssh/demiurge_deploy_key root@<INSTANCE_IP>:~/.ssh/id_ed25519
+# scp ~/.ssh/demiurge_deploy_key root@<POD_HOST>:~/.ssh/id_ed25519  (run locally first)
 chmod 600 ~/.ssh/id_ed25519
 ssh-keyscan github.com >> ~/.ssh/known_hosts
 ```
 
 ---
 
-## Step 2: SSH and Bootstrap
+## Step 2: SSH into the Pod
+
+RunPod exposes SSH via a non-standard port on their gateway host rather than
+directly on the pod IP. After the pod is running:
+
+1. In the RunPod console, click **Connect** on your pod
+2. Copy the **SSH over exposed TCP** connection string. It looks like:
+   ```
+   ssh root@ssh.runpod.io -p <PORT>
+   ```
+   or for newer pods:
+   ```
+   ssh root@<POD_ID>-22.proxy.runpod.net
+   ```
+3. Connect:
+   ```bash
+   ssh root@ssh.runpod.io -p <PORT>
+   # or whichever string RunPod gives you
+   ```
+
+> [!NOTE]
+> The connection string changes each time you redeploy. Always copy it fresh
+> from the RunPod console **Connect** button rather than reusing a saved string.
+
+---
+
+## Step 3: Bootstrap the Pod
+
+Copy the setup script and run it:
 
 ```bash
-# Replace <INSTANCE_IP> with the actual IPv4 from Step 1.
-ssh root@<INSTANCE_IP>
+# On your LOCAL machine (use the RunPod connection string from Step 2):
+scp -P <PORT> scripts/cloud_setup.sh root@ssh.runpod.io:/root/cloud_setup.sh
 ```
 
-Once connected, run the bootstrap script. Use `scp` to copy it to the instance:
-
+For the newer proxy URL pattern:
 ```bash
-# On your LOCAL machine:
-scp scripts/cloud_setup.sh root@<INSTANCE_IP>:/root/cloud_setup.sh
+scp scripts/cloud_setup.sh root@<POD_ID>-22.proxy.runpod.net:/root/cloud_setup.sh
+```
 
-# On the INSTANCE:
+Then on the pod:
+```bash
 bash /root/cloud_setup.sh
 ```
 
@@ -122,30 +122,27 @@ The bootstrap script:
 Expected bootstrap time: 5-10 minutes (dominated by `uv sync` pulling pydrake).
 
 > [!IMPORTANT]
-> Before starting generation, verify `data/v1/` is empty or absent:
+> Before starting generation, verify `data/v1/` is empty:
 > ```bash
 > ls /root/Demiurge/data/v1/
 > ```
-> If it contains any `.tar` shards from a previous run, remove them:
+> If it contains `.tar` shards from a previous attempt, clear them:
 > ```bash
 > rm -rf /root/Demiurge/data/v1 && mkdir -p /root/Demiurge/data/v1
 > ```
-> Starting with stale shards will corrupt the manifest.
 
 ---
 
-## Step 3: Start Generation in tmux
+## Step 4: Start Generation in tmux
 
-Always run the generation inside `tmux` so it survives SSH disconnection.
+Always run inside `tmux` so the job survives SSH disconnection.
 
 ```bash
-# On the INSTANCE:
+# On the pod:
 cd /root/Demiurge
-
-# Start a tmux session
 tmux new -s gen
 
-# Inside tmux, start the run
+# Inside tmux:
 nohup uv run python scripts/generate_dataset.py \
     --config configs/dataset/v1.yaml \
     --seed 42 \
@@ -156,20 +153,18 @@ echo "Generation PID: $PID"
 echo $PID > logs/generate_v1.pid
 ```
 
-Detach from tmux: `Ctrl-b d`
-
-Reattach later: `tmux attach -t gen`
+Detach: `Ctrl-b d` -- Reattach: `tmux attach -t gen`
 
 ### Monitor progress
 
 ```bash
-# Follow the log (from any SSH session)
+# Follow the log
 tail -f /root/Demiurge/logs/generate_v1.log
 
-# System resource check
+# System check
 htop
 
-# Accepted scene count (from manifest)
+# Scene count from manifest
 python3 -c "
 import json, pathlib
 m = pathlib.Path('/root/Demiurge/data/v1/manifest.json')
@@ -181,29 +176,33 @@ else:
 "
 ```
 
-### Expected checkpoints
+### Expected checkpoints (16 vCPU pod, 15 workers)
 
-| Time | Expected scenes accepted |
+| Time | Expected scenes |
 |---|---|
 | +1h | ~6,200 |
 | +4h | ~24,800 |
-| +8h | ~49,600 (near completion) |
+| +8h | ~49,600 |
 | +8.5h | 50,000 (done) |
 
-These are estimates based on 1.718 acc/s on CCX43 at 2s budget. Actual rate
-may vary by +/-20% depending on AMD core performance and memory bandwidth.
+Estimates based on 1.718 acc/s at 2s budget. Actual rate may vary +/-20%.
+
+> [!NOTE]
+> RunPod CPU pods bill per-minute. If you want to sanity-check throughput
+> before committing to the full run, let it run for 15-20 minutes, check the
+> manifest scene count, and extrapolate. Cost for a 20-minute test: <$0.10.
 
 ---
 
-## Step 4: Verify and Retrieve Data
+## Step 5: Verify and Retrieve Data
 
-When the log shows `Generation complete` or `target_n reached`:
+When the log shows generation complete:
 
-### Verify the manifest on the instance
+### Verify the manifest on the pod
 
 ```bash
 python3 -c "
-import json, pathlib, hashlib
+import json, pathlib
 
 manifest_path = pathlib.Path('/root/Demiurge/data/v1/manifest.json')
 d = json.loads(manifest_path.read_text())
@@ -212,32 +211,38 @@ print(f'Scenes accepted: {d[\"n_total\"]}')
 print(f'Shards: {d[\"n_shards\"]}')
 print(f'Dataset hash: {d.get(\"dataset_hash\", \"N/A\")}')
 
-# Verify shard files exist
 missing = []
 for shard in d.get('shards', []):
     p = manifest_path.parent / shard['filename']
     if not p.exists():
         missing.append(shard['filename'])
-if missing:
-    print(f'MISSING SHARDS: {missing}')
-else:
-    print('All shards present.')
+print('MISSING SHARDS:' if missing else 'All shards present.', missing or '')
 "
 ```
 
 ### rsync to local machine
 
 ```bash
-# On your LOCAL machine:
+# On your LOCAL machine (use your RunPod connection details):
 rsync -avz --progress \
-    root@<INSTANCE_IP>:/root/Demiurge/data/v1/ \
+    -e "ssh -p <PORT>" \
+    root@ssh.runpod.io:/root/Demiurge/data/v1/ \
     ./data/v1/
 
 # Also retrieve the log
-rsync -avz root@<INSTANCE_IP>:/root/Demiurge/logs/generate_v1.log ./logs/
+rsync -avz -e "ssh -p <PORT>" \
+    root@ssh.runpod.io:/root/Demiurge/logs/generate_v1.log \
+    ./logs/
 ```
 
-Verify the local copy matches the remote manifest before destroying the instance:
+For the proxy URL pattern:
+```bash
+rsync -avz --progress \
+    root@<POD_ID>-22.proxy.runpod.net:/root/Demiurge/data/v1/ \
+    ./data/v1/
+```
+
+Verify the local copy before destroying the pod:
 
 ```bash
 # On LOCAL:
@@ -248,56 +253,25 @@ manifest = json.loads(pathlib.Path('data/v1/manifest.json').read_text())
 n_shards = manifest['n_shards']
 local_shards = list(pathlib.Path('data/v1').glob('*.tar'))
 print(f'Manifest shards: {n_shards}, Local shards: {len(local_shards)}')
-assert len(local_shards) == n_shards, 'Shard count mismatch -- do not destroy instance'
-print('Shard count OK. Safe to destroy.')
+assert len(local_shards) == n_shards, 'Shard count mismatch -- do not terminate pod'
+print('Shard count OK. Safe to terminate.')
 "
 ```
 
 ---
 
-## Step 5: Destroy the Instance (Kill Switch)
+## Step 6: Terminate the Pod (Kill Switch)
 
 > [!CAUTION]
-> Only destroy the instance AFTER verifying the local shard count matches the manifest.
-> Instance destruction is irreversible. There is no Hetzner undo.
+> Only terminate AFTER verifying the local shard count matches the manifest.
+> Pod termination is irreversible. RunPod does not have an undo.
 
-### Option A: Web UI
+1. Go to [runpod.io](https://www.runpod.io) > **Pods**
+2. Find `demiurge-gen` (or whatever you named it)
+3. Click the **...** menu > **Terminate**
+4. Confirm termination
 
-1. Go to [console.hetzner.cloud](https://console.hetzner.cloud) > Your Project > Servers
-2. Click `demiurge-gen` > Actions > **Delete**
-3. Confirm deletion
-
-### Option B: hcloud CLI
-
-```bash
-hcloud server delete demiurge-gen
-```
-
-### Verify deletion
-
-```bash
-hcloud server list | grep demiurge-gen
-# Should return nothing.
-```
-
----
-
-## CCX33 Fallback Procedure
-
-If CCX43 is unavailable in your chosen datacenter:
-
-1. Provision CCX33 instead (8 dedicated AMD cores, 32 GB RAM, ~$0.10/hr)
-2. Update `configs/dataset/v1.yaml`:
-   ```yaml
-   num_workers: 7   # CCX33: 8 cores minus 1 for OS/writer
-   ```
-3. The CCX33 50k projection at 2s budget is ~15.0h (vs 8.1h on CCX43).
-   Cost: ~$1.50. Still within the approved 20h wall-clock gate.
-4. Run the same `cloud_setup.sh` bootstrap and generation command unchanged.
-
-> [!NOTE]
-> The CCX43 -> CCX33 worker reduction (15 -> 7) is the only required change.
-> `target_n`, `rrt_budget_s`, and `seed` remain unchanged.
+Billing stops immediately on termination.
 
 ---
 
@@ -305,13 +279,60 @@ If CCX43 is unavailable in your chosen datacenter:
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| Instance | CCX43 (16 cores, 64 GB) | Dedicated cores, no noisy-neighbor throttling |
-| Workers | 15 | 16 cores minus 1 for OS + writer; writer bottleneck caps at ~13x single-worker |
-| RRT budget | 2s | 9.8% acceptance; 8.1h CCX43 projection passes <12h gate |
+| Provider | RunPod CPU pod | Hetzner CCX43 unavailable across all DCs; RunPod is also Week 3 GPU provider |
+| Pod size | 16 vCPU, ~32 GB RAM | Matches CCX43 core count; fallback: 8 vCPU |
+| Workers | 15 (or vCPU - 1) | Writer bottleneck caps throughput at ~(cores-1) |
+| RRT budget | 2s | 9.8% acceptance; ~8.1h projection on 16 vCPU |
 | Target | 50,000 scenes | Full production dataset for Week 3 training |
 | Vocab | 12 objects (IDs 0-11) | 4 large-volume entries dropped after 16-vocab profiling |
 | Seed | 42 | Fixed; logged in W&B run for reproducibility |
-| Cost estimate | ~$1.70-3.50 | CCX43 at $0.21/hr for 8-17h including setup/teardown |
 
 Gate override: per-template <20% acceptance rate override approved 2026-05-12.
 See `artifacts/validator_profile.md` for full profiling record and rationale.
+
+---
+
+## Appendix: Hetzner CCX43 (Fallback)
+
+If RunPod CPU pods are unavailable or unsuitable, the original Hetzner provisioning
+instructions follow. These were the primary target before CCX43 was found unavailable.
+
+### Provision
+
+**Option A: Web UI**
+
+1. Sign in to [console.hetzner.cloud](https://console.hetzner.cloud)
+2. **Add Server** > Location: **Ashburn (ASH)** or **Hillsboro (HIL)**
+   (EU fallbacks: Falkenstein FSN1, Nuremberg NBG1 -- add ~30-60 min rsync time)
+3. Image: Ubuntu 24.04 | Type: Dedicated vCPU > **CCX43** (16 vCPU, 64 GB)
+4. SSH Key: select your uploaded key | Name: `demiurge-gen`
+5. **Create & Buy Now** -- note the IPv4 address
+
+**Option B: hcloud CLI**
+
+```bash
+hcloud server create \
+    --name demiurge-gen \
+    --type ccx43 \
+    --image ubuntu-24.04 \
+    --location ash \
+    --ssh-key <your-ssh-key-name>
+
+hcloud server describe demiurge-gen | grep "Public Net"
+```
+
+> US locations: `ash` (Ashburn, VA), `hil` (Hillsboro, OR).
+> EU fallbacks: `fsn1`, `nbg1`. CCX33 fallback type: `ccx33` (8 vCPU, 32 GB, set `num_workers: 7`).
+
+### SSH and Bootstrap
+
+```bash
+ssh root@<INSTANCE_IP>
+scp scripts/cloud_setup.sh root@<INSTANCE_IP>:/root/cloud_setup.sh
+# On the instance:
+bash /root/cloud_setup.sh
+```
+
+Steps 4-6 (generation, rsync, destroy) are identical to the RunPod instructions above,
+substituting `ssh root@<INSTANCE_IP>` for the RunPod connection string and
+`hcloud server delete demiurge-gen` for the RunPod terminate step.

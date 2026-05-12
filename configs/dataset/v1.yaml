@@ -8,18 +8,19 @@
 
 # --- Decision record ---
 # 8-vocab profile (seed=0, 500 attempts): 13.2% overall acceptance.
-# 12-vocab profile (seed=0, 500 attempts, after dropping 4 high-volume entries):
-#   [results TBD -- see re-profile run before cloud launch]
+# 12-vocab re-profile (12-vocab, seed=0, 500 attempts): 9.8% overall acceptance.
+#   stable_rest recovered to 97.2% after dropping 4 large-volume entries.
+#   2s CCX43 projection: 8.1h -- OK gate (<12h).
 #
-# Cloud target: Hetzner CCX43 (16 dedicated AMD cores, 64 GB RAM, ~$0.21/hr).
-# Worker count: 15 (16 cores minus 1 reserved for OS and writer process).
-# Writer bottleneck: single-threaded tar-write stream; past ~15 workers,
+# Cloud provider: RunPod CPU pod (Hetzner CCX43 unavailable across all DCs).
+# Target: 16 vCPU pod (~32 GB RAM); fallback: 8 vCPU.
+# Worker count: set to (vCPU count - 1); default below assumes 16 vCPU.
+# Writer bottleneck: single-threaded tar-write stream; past (cores-1) workers,
 # throughput degrades due to context-switching and cache thrashing.
-# CCX43 vs CCX33 decision: CCX43 halves wall-clock at negligible cost delta
-# (~$3.15 vs ~$3.00 for 50k scenes). CCX33 documented as fallback in docs/cloud_run.md.
+# RunPod is also the Week 3 GPU provider -- consolidating on one vendor.
 #
 # Vocab: 12-object set (IDs 0-11). IDs 12-15 dropped; see validator_profile.md.
-# See artifacts/validator_profile.md for full measurement record.
+# See artifacts/validator_profile.md for full profiling record.
 
 # --- Target ---
 target_n: 50000
@@ -39,8 +40,9 @@ rrt_budget_s: 2.0       # BiRRT wall-clock budget per scene (seconds)
 shard_size_mb: 500      # Maximum size of each .tar shard
 
 # --- Generation ---
-num_workers: 15         # ProcessPoolExecutor workers on CCX43 (16 cores, 1 reserved for OS+writer)
-                        # Writer is single-threaded tar; >15 workers causes context-switch thrash
+num_workers: 15         # Adjust to (vCPU_count - 1) based on actual RunPod pod size.
+                        # Default 15 assumes 16 vCPU pod; use 7 for 8 vCPU pod.
+                        # Writer is single-threaded tar; exceeding (cores-1) causes thrash.
 batch_size: 64          # Candidates sampled and dispatched per round
 # Hard stop: if total attempts exceed target_n * max_attempts_multiplier, halt with error.
 max_attempts_multiplier: 10
@@ -50,4 +52,4 @@ wandb:
   enabled: false        # Set to true for production; requires WANDB_API_KEY
   project: "demiurge"
   entity: null          # null = use default entity from wandb login
-  tags: ["data", "v1", "50k", "2s_budget", "12vocab", "ccx43"]
+  tags: ["data", "v1", "50k", "2s_budget", "12vocab", "runpod"]
