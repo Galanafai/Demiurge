@@ -1,11 +1,11 @@
 """Object vocabulary for the Demiurge scene schema.
 
-Defines OBJECT_VOCAB: a fixed 8-entry registry mapping integer type IDs to ObjectEntry
+Defines OBJECT_VOCAB: a fixed 16-entry registry mapping integer type IDs to ObjectEntry
 instances. All SDFs are inline geometry strings. The PyPI drake wheel does not ship YCB
-mesh assets, so YCB-keyed entries (IDs 5-7) use primitive approximations with dimensions
+mesh assets, so YCB-keyed entries (IDs 5-15) use primitive approximations with dimensions
 matched to the real YCB objects. This is sufficient for Drake collision and IK checks.
 
-Do not add entries beyond ID 7 without explicit approval (AGENTS.md: fixed vocabulary).
+Do not add entries beyond ID 15 without explicit approval (AGENTS.md: fixed vocabulary).
 """
 
 from __future__ import annotations
@@ -22,9 +22,19 @@ class ObjectTypeId(IntEnum):
     CYLINDER = 2
     BOX_TALL = 3
     BOX_FLAT = 4
-    MUSTARD_BOTTLE = 5  # YCB 006: approximated as cylinder r=0.03 h=0.19
-    SUGAR_BOX = 6  # YCB 004: approximated as box 0.038 x 0.086 x 0.175
+    MUSTARD_BOTTLE = 5   # YCB 006: approximated as cylinder r=0.03 h=0.19
+    SUGAR_BOX = 6        # YCB 004: approximated as box 0.038 x 0.086 x 0.175
     TOMATO_SOUP_CAN = 7  # YCB 005: approximated as cylinder r=0.033 h=0.102
+    # Week 2.5 expansion: 8 new YCB-keyed entries (inline primitives; mesh SDFs not
+    # shipped in the PyPI drake wheel).
+    BLEACH_CLEANSER = 8   # YCB 021: cylinder r=0.040 h=0.250
+    BANANA = 9            # YCB 011: box 0.090 x 0.040 x 0.180 (oriented lengthwise)
+    MASTER_CHEF_CAN = 10  # YCB 002: cylinder r=0.052 h=0.142
+    GELATIN_BOX = 11      # YCB 009: box 0.056 x 0.112 x 0.166
+    PUDDING_BOX = 12      # YCB 008: box 0.124 x 0.166 x 0.044
+    CRACKER_BOX = 13      # YCB 003: box 0.120 x 0.316 x 0.042
+    POTTED_MEAT_CAN = 14  # YCB 010: cylinder r=0.043 h=0.110
+    POWER_DRILL = 15      # YCB 035: box 0.186 x 0.094 x 0.350
 
 
 @dataclass(frozen=True)
@@ -193,9 +203,70 @@ OBJECT_VOCAB: dict[int, ObjectEntry] = {
         sdf_template=_CYLINDER_SDF,
         sdf_kind="cylinder",
     ),
+    # -------------------------------------------------------------------------
+    # Week 2.5 additions: YCB-keyed inline primitives.
+    # Dimensions sourced from YCB dataset bounding-box measurements.
+    # Bounding radius = sqrt(hx^2+hy^2+hz^2) for box, sqrt(r^2+(h/2)^2) for cylinder.
+    # -------------------------------------------------------------------------
+    ObjectTypeId.BLEACH_CLEANSER: ObjectEntry(
+        name="bleach_cleanser",
+        bounding_radius_m=0.132,  # sqrt(0.040^2 + 0.125^2)
+        canonical_half_extents_m=(0.040, 0.040, 0.125),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+    ),
+    ObjectTypeId.BANANA: ObjectEntry(
+        name="banana",
+        bounding_radius_m=0.103,  # sqrt(0.045^2 + 0.020^2 + 0.090^2) = 0.1026
+        canonical_half_extents_m=(0.045, 0.020, 0.090),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.MASTER_CHEF_CAN: ObjectEntry(
+        name="master_chef_can",
+        bounding_radius_m=0.088,  # sqrt(0.052^2 + 0.071^2)
+        canonical_half_extents_m=(0.052, 0.052, 0.071),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+    ),
+    ObjectTypeId.GELATIN_BOX: ObjectEntry(
+        name="gelatin_box",
+        bounding_radius_m=0.104,  # sqrt(0.028^2 + 0.056^2 + 0.083^2)
+        canonical_half_extents_m=(0.028, 0.056, 0.083),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.PUDDING_BOX: ObjectEntry(
+        name="pudding_box",
+        bounding_radius_m=0.106,  # sqrt(0.062^2 + 0.083^2 + 0.022^2)
+        canonical_half_extents_m=(0.062, 0.083, 0.022),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.CRACKER_BOX: ObjectEntry(
+        name="cracker_box",
+        bounding_radius_m=0.170,  # sqrt(0.060^2 + 0.158^2 + 0.021^2) = 0.1703
+        canonical_half_extents_m=(0.060, 0.158, 0.021),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.POTTED_MEAT_CAN: ObjectEntry(
+        name="potted_meat_can",
+        bounding_radius_m=0.070,  # sqrt(0.043^2 + 0.055^2)
+        canonical_half_extents_m=(0.043, 0.043, 0.055),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+    ),
+    ObjectTypeId.POWER_DRILL: ObjectEntry(
+        name="power_drill",
+        bounding_radius_m=0.204,  # sqrt(0.093^2 + 0.047^2 + 0.175^2) = 0.2037
+        canonical_half_extents_m=(0.093, 0.047, 0.175),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
 }
 
-assert len(OBJECT_VOCAB) == 8, "Vocabulary must have exactly 8 entries."
+assert len(OBJECT_VOCAB) == 16, "Vocabulary must have exactly 16 entries."
 
 
 def build_sdf(entry: ObjectEntry, model_name: str, scale: float = 1.0, mass: float = 0.5) -> str:

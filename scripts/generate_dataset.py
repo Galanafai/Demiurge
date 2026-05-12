@@ -408,7 +408,9 @@ def main() -> int:
 
                     if report.accepted:
                         desc = generate_description(candidate, desc_rng)
-                        writer.write(candidate.scene, desc, _report_to_dict(report))
+                        report_dict = _report_to_dict(report)
+                        report_dict["task_family"] = candidate.task_family
+                        writer.write(candidate.scene, desc, report_dict)
                         template_accepted[candidate.task_family] += 1
                         pbar.update(1)
 

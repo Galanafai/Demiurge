@@ -1,6 +1,6 @@
 """Scene tensor schema for the Demiurge diffusion model.
 
-SceneTensor is the fixed-length representation of a tabletop scene. It holds up to N_MAX=8
+SceneTensor is the fixed-length representation of a tabletop scene. It holds up to N_MAX=16
 objects. Inactive slots are masked by the presence field. All numerical fields are stored
 as float32 tensors. The dataclass is frozen to prevent accidental in-place mutation; all
 transformations return new instances.
@@ -21,8 +21,8 @@ from typing import NamedTuple
 
 import torch
 
-N_MAX: int = 8
-"""Maximum number of objects in a scene. Fixed at 8 per AGENTS.md architecture spec."""
+N_MAX: int = 16
+"""Maximum number of objects in a scene. Fixed at 16 per Week 2.5 vocab expansion."""
 
 QUAT_NORM_TOL: float = 1e-6
 """Minimum quaternion norm below which re-projection is skipped to avoid NaN."""
@@ -55,7 +55,7 @@ class SceneTensor:
     gated by the presence mask.
 
     Attributes:
-        object_types: Long tensor [N_MAX] of ObjectTypeId values (0-7). Inactive slots
+        object_types: Long tensor [N_MAX] of ObjectTypeId values (0-15). Inactive slots
             contain 0 (CUBE) but are ignored when presence is False.
         poses: Float tensor [N_MAX, 7]. Columns 0:3 are xyz position in metres;
             columns 3:7 are quaternion in wxyz convention. Quaternions in present
