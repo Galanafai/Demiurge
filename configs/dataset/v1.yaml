@@ -7,24 +7,22 @@
 #   ... --override output_dir=data/v1_test target_n=1000
 
 # --- Decision record ---
-# Task 5 profiling (seed=0, 500 attempts per arm) measured:
-#   tabletop_reach:    18.5% (5s), 18.0% (2s)
-#   cluttered_pick:     8.1% (5s),  6.4% (2s)  <- floor, by design
-#   obstacle_avoidance: 12.7% (5s), 12.7% (2s)
-#   Overall:           13.2% (5s), 12.4% (2s)
+# 8-vocab profile (seed=0, 500 attempts): 13.2% overall acceptance.
+# 12-vocab profile (seed=0, 500 attempts, after dropping 4 high-volume entries):
+#   [results TBD -- see re-profile run before cloud launch]
 #
-# All templates triggered the halt-gate (< 20%). The cluttered_pick floor is
-# intentional: dense placement is the whole point of that template. Tuning it
-# toward 20% would collapse difficulty stratification and undermine the
-# "does the model handle clutter" evaluation in Week 5.
+# Cloud target: Hetzner CCX43 (16 dedicated AMD cores, 64 GB RAM, ~$0.21/hr).
+# Worker count: 15 (16 cores minus 1 reserved for OS and writer process).
+# Writer bottleneck: single-threaded tar-write stream; past ~15 workers,
+# throughput degrades due to context-switching and cache thrashing.
+# CCX43 vs CCX33 decision: CCX43 halves wall-clock at negligible cost delta
+# (~$3.15 vs ~$3.00 for 50k scenes). CCX33 documented as fallback in docs/cloud_run.md.
 #
-# Decision (Option B): 15k target, 2s budget, 4 workers (6 cores; 4 workers
-# avoids oversubscription). Projected wall-clock: ~8h.
-# If Week 5 shows more data is needed, extend with seed offsets on cloud.
+# Vocab: 12-object set (IDs 0-11). IDs 12-15 dropped; see validator_profile.md.
 # See artifacts/validator_profile.md for full measurement record.
 
 # --- Target ---
-target_n: 15000
+target_n: 50000
 output_dir: "data/v1"
 
 # --- Template mix (must sum to 1.0) ---
@@ -41,8 +39,8 @@ rrt_budget_s: 2.0       # BiRRT wall-clock budget per scene (seconds)
 shard_size_mb: 500      # Maximum size of each .tar shard
 
 # --- Generation ---
-num_workers: 4          # ProcessPoolExecutor workers (each holds one SceneValidator)
-                        # 4 workers on 6 cores avoids oversubscription; tested at 0.54 acc/s
+num_workers: 15         # ProcessPoolExecutor workers on CCX43 (16 cores, 1 reserved for OS+writer)
+                        # Writer is single-threaded tar; >15 workers causes context-switch thrash
 batch_size: 64          # Candidates sampled and dispatched per round
 # Hard stop: if total attempts exceed target_n * max_attempts_multiplier, halt with error.
 max_attempts_multiplier: 10
@@ -52,4 +50,4 @@ wandb:
   enabled: false        # Set to true for production; requires WANDB_API_KEY
   project: "demiurge"
   entity: null          # null = use default entity from wandb login
-  tags: ["data", "v1", "15k", "2s_budget"]
+  tags: ["data", "v1", "50k", "2s_budget", "12vocab", "ccx43"]

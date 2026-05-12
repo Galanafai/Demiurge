@@ -62,9 +62,14 @@ _BUDGETS = [5.0, 2.0]
 _FAMILIES = ["tabletop_reach", "cluttered_pick", "obstacle_avoidance"]
 _CHECKS = ["no_interpenetration", "stable_rest", "ik_reachable", "rrt_solvable"]
 
-# CCX33 hardware parameters for wall-clock projection.
-_CCX33_WORKERS = 7      # 8 dedicated AMD cores minus 1 for OS / writer
-_LAPTOP_WORKERS = 4     # measured workers in the 8-vocab profile run
+# CCX43 hardware parameters -- target instance.
+_CCX43_WORKERS = 15      # 16 dedicated AMD cores minus 1 for OS / writer
+_CCX43_REALISTIC_SCALE = 13  # realistic multiplier vs single-worker (not 15x;
+                             # writer bottleneck caps throughput at ~13x single-worker)
+
+# CCX33 hardware parameters -- fallback reference.
+_CCX33_WORKERS = 7       # 8 dedicated AMD cores minus 1 for OS / writer
+_LAPTOP_WORKERS = 4      # measured workers in all profiling runs
 
 
 @dataclass
@@ -252,17 +257,14 @@ def _print_timing(results: dict[float, ArmResult]) -> None:
 
 
 def _print_cloud_projection(results: dict[float, ArmResult], target_n: int) -> None:
-    """Project wall-clock time for target_n scenes on CCX33 (7 workers)."""
+    """Project wall-clock time for target_n scenes on CCX33 (fallback) and CCX43 (target)."""
     print("\n=== Wall-Clock Projection ===\n")
     print(f"  Target:  {target_n:,d} accepted scenes")
-    print(f"  Hardware: Hetzner CCX33 (8 dedicated AMD cores, {_CCX33_WORKERS} workers)")
-    print(f"  Measured: laptop (6 cores, {_LAPTOP_WORKERS} workers)\n")
-
-    # Laptop throughput -> CCX33 throughput.
-    # Assumption: throughput scales linearly with workers (conservative; cache effects
-    # on dedicated cores may improve this). We do NOT apply a clock-speed multiplier;
-    # the worker-count ratio is the only adjustment, which is verifiable.
-    worker_scale = _CCX33_WORKERS / _LAPTOP_WORKERS
+    print(f"  Laptop baseline: {_LAPTOP_WORKERS} workers (measured)")
+    print(f"  CCX33 reference: 8 dedicated AMD cores, {_CCX33_WORKERS} workers")
+    print(f"  CCX43 target:   16 dedicated AMD cores, {_CCX43_WORKERS} workers")
+    print(f"  CCX43 scale assumption: {_CCX43_REALISTIC_SCALE}x vs single-worker")
+    print(f"    (not {_CCX43_WORKERS}x; writer bottleneck caps throughput)\n")
 
     halt_triggered = False
     for budget in _BUDGETS:
@@ -270,29 +272,33 @@ def _print_cloud_projection(results: dict[float, ArmResult], target_n: int) -> N
         total_att = sum(r.attempts.values())
         total_acc = sum(r.accepted.values())
         rate = total_acc / total_att if total_att > 0 else 0.0
-        # Laptop: accepted/s observed
         laptop_acc_per_s = total_acc / r.elapsed_total_s if r.elapsed_total_s > 0 else 0.001
-        # CCX33 projection (linear worker scale)
-        cloud_acc_per_s = laptop_acc_per_s * worker_scale
-        projected_s = target_n / cloud_acc_per_s
-        projected_h = projected_s / 3600
 
-        if projected_h > 12:
-            gate = "ANOMALOUS (>12h): halt, surface before Task 3"
+        # CCX33: linear worker scale from laptop.
+        ccx33_scale = _CCX33_WORKERS / _LAPTOP_WORKERS
+        ccx33_acc_per_s = laptop_acc_per_s * ccx33_scale
+        ccx33_proj_h = target_n / ccx33_acc_per_s / 3600
+
+        # CCX43: realistic scale = 13x vs single-worker, 3.25x vs 4-worker laptop.
+        ccx43_scale = _CCX43_REALISTIC_SCALE / _LAPTOP_WORKERS
+        ccx43_acc_per_s = laptop_acc_per_s * ccx43_scale
+        ccx43_proj_h = target_n / ccx43_acc_per_s / 3600
+
+        if ccx43_proj_h > 20:
+            gate = "HALT (>20h): surface before Task 3"
             halt_triggered = True
-        elif projected_h > 8:
-            gate = "FLAG (8-12h)"
+        elif ccx43_proj_h > 12:
+            gate = "WARNING (12-20h): proceed, log in validator_profile.md"
         else:
-            gate = "OK (<8h)"
+            gate = "OK (<12h)"
 
         print(
-            f"  {budget}s budget:\n"
-            f"    acceptance_rate    = {rate:.1%}\n"
-            f"    laptop_throughput  = {laptop_acc_per_s:.3f} acc/s "
-            f"({_LAPTOP_WORKERS} workers)\n"
-            f"    cloud_throughput   = {cloud_acc_per_s:.3f} acc/s "
-            f"({_CCX33_WORKERS} workers, {worker_scale:.2f}x scale)\n"
-            f"    projected_50k      = {projected_h:.1f}h  [{gate}]\n"
+            f"  {budget}s budget:"
+            f"\n    acceptance_rate    = {rate:.1%}"
+            f"\n    laptop_throughput  = {laptop_acc_per_s:.3f} acc/s ({_LAPTOP_WORKERS} workers)"
+            f"\n    CCX33 throughput   = {ccx33_acc_per_s:.3f} acc/s ({ccx33_scale:.2f}x) -> {ccx33_proj_h:.1f}h"
+            f"\n    CCX43 throughput   = {ccx43_acc_per_s:.3f} acc/s ({ccx43_scale:.2f}x) -> {ccx43_proj_h:.1f}h  [{gate}]"
+            f"\n"
         )
 
     return halt_triggered

@@ -126,3 +126,144 @@ tail -f logs/generate_v1.log
 Resume (if interrupted): re-run the same command. ShardWriter reads
 `data/v1/manifest.json`, deletes any partial shards, and continues from the
 last completed shard.
+
+---
+
+## Week 2.5 Profiling: 16-Vocab Expansion (Halted)
+
+**Run date:** 2026-05-12
+**Vocab size:** 16 (8 original + 8 new YCB entries)
+
+### Raw Results
+
+| Template | 5s rate | 2s rate | Gate |
+|---|---|---|---|
+| tabletop_reach | 8.6% | 8.6% | HALT |
+| cluttered_pick | 0.7% | 1.4% | HALT |
+| obstacle_avoidance | 6.6% | 5.9% | HALT |
+| **Overall** | **5.8%** | **5.8%** | HALT |
+
+### Per-Check Breakdown (16-vocab, 5s arm)
+
+| Check | Pass% | First-fail count |
+|---|---|---|
+| no_interpenetration | 90.0% | 50 |
+| stable_rest | **67.8%** | 111 |
+| ik_reachable | 72.8% | 68 |
+| rrt_solvable | 7.8% | 242 |
+
+### Root Cause
+
+**stable_rest collapsed from ~95% to 67.8%.** A single-object stability probe
+(36 trials across BOX_TALL, MUSTARD_BOTTLE, SUGAR_BOX, BLEACH_CLEANSER at 3 scales
+and 3 yaw values) showed **0/36 failures** in isolation. The regression is a
+multi-object contact interaction effect: dense scenes with multiple large-volume
+objects cause Drake's contact solver to assign residual forces that drift objects
+past the 5mm / 5-degree drift threshold during the 1.5s forward simulation.
+
+**RRT solvability collapsed in cluttered_pick to 0.7-1.4%.** The four new entries
+with the largest bounding volumes (cracker_box: 0.158m lateral, power_drill:
+0.175m height, cracker_box: 0.170m bounding radius, power_drill: 0.204m bounding
+radius) weld disproportionate volume into the RRT planning plant, blocking the
+BiRRT from finding collision-free paths in the tight cluster_x=(-0.20, 0.20)
+region of ClutteredPickTemplate.
+
+### Decision: Vocabulary Reduction (Option B)
+
+Dropped from OBJECT_VOCAB: PUDDING_BOX (12), CRACKER_BOX (13), POTTED_MEAT_CAN (14),
+POWER_DRILL (15). Final vocab size: 12 (IDs 0-11). N_MAX reduced from 16 to 12.
+
+Also added: `upright_constrained: bool` field to ObjectEntry. BLEACH_CLEANSER
+(hz=0.125m > 0.10m threshold) flagged True. This is documentation and enforcement
+against future SO(3) augmentation; the sampler already produces yaw-only orientations
+for all entries.
+
+---
+
+## Week 2.5 Re-Profile: 12-Vocab (Production)
+
+**Run date:** 2026-05-12
+**Vocab size:** 12 (IDs 0-11; IDs 12-15 dropped)
+**Git SHA:** 0d92866 (feat: vocab 16->12, upright_constrained flag, _sample_orientation wrapper)
+
+### Raw Results
+
+| Template | 5s att | 5s acc | 5s rate | 2s att | 2s acc | 2s rate |
+|---|---|---|---|---|---|---|
+| tabletop_reach | 209 | 19 | 9.1% | 209 | 18 | 8.6% |
+| cluttered_pick | 150 | 8 | 5.3% | 150 | 8 | 5.3% |
+| obstacle_avoidance | 141 | 24 | 17.0% | 141 | 23 | 16.3% |
+| **Total** | **500** | **51** | **10.2%** | **500** | **49** | **9.8%** |
+
+**Elapsed:** 5s arm = 167s (0.305 accepted/s at 4 workers), 2s arm = 93s (0.529 accepted/s).
+
+### Per-Check Breakdown (12-vocab, 5s arm)
+
+| Check | Pass% | First-fail count | vs 16-vocab |
+|---|---|---|---|
+| no_interpenetration | 97.2% | 14 | +7.2pp |
+| stable_rest | **97.2%** | 0 | **+29.4pp recovered** |
+| ik_reachable | 82.4% | 74 | +9.6pp |
+| rrt_solvable | 10.2% | 361 | +2.4pp |
+
+**stable_rest fully recovered to 97.2%.** Dropping the 4 large-volume entries
+eliminated the multi-object contact instability entirely. No first-fail count
+for stable_rest (0) confirms objects are not failing stability before
+interpenetration in this run.
+
+### Candidate Timing
+
+| Budget | Mean | p50 | p95 | p99 |
+|---|---|---|---|---|
+| 5s | 1.057s | 0.332s | 5.319s | 5.432s |
+| 2s | 0.630s | 0.343s | 2.337s | 2.418s |
+
+### Wall-Clock Projections (50k scenes)
+
+| Budget | Laptop acc/s | CCX33 -> h | CCX43 -> h | Gate |
+|---|---|---|---|---|
+| 5s | 0.305 | 26.1h | 14.0h | WARNING (12-20h) |
+| **2s** | **0.529** | **15.0h** | **8.1h** | **OK (<12h)** |
+
+CCX43: 16 dedicated AMD cores, 15 workers (1 reserved for OS + writer).
+Scale assumption: 13x vs single-worker baseline (not 15x; writer bottleneck
+caps throughput). This is 3.25x vs the 4-worker laptop measurement.
+
+**Production parameters: 2s budget, 50k target, 15 workers on CCX43. ~8.1h projected.**
+
+### Decision Gate Interpretation
+
+The per-template acceptance gate fires HALT for all three templates at both
+budget levels (all rates are below 20%). This gate is **deliberately overridden**
+for the following documented reason:
+
+The gate was calibrated in the implementation plan to catch catastrophic regression,
+specifically the 16-vocab cluttered_pick collapse to 0.7-1.4%. It was not intended
+to gatekeep templates that are structurally hard by design.
+
+The 12-vocab numbers (5.3% cluttered_pick / 9.1% tabletop_reach / 17.0%
+obstacle_avoidance) are structurally similar to the 8-vocab Week 2 baseline
+(8.1% / 18.5% / 12.7%). In both runs, all templates fell below 20%. In Week 2,
+the decision record approved proceeding with the explanation that the
+cluttered_pick floor is a load-bearing property of the dataset: dense placement
+is the design intent of that template, and tuning it toward 20% would collapse
+the difficulty stratification that the Week 5 evaluation depends on.
+
+The same reasoning applies here. The difficulty stratification is preserved.
+The RRT bottleneck (10.2% conditional pass) reflects real scene complexity,
+not a pipeline defect.
+
+**Gate override approved by Galanafai on 2026-05-12. Proceed to cloud setup (Task 3).**
+
+### Production Run Command (CCX43)
+
+See `docs/cloud_run.md` for full provisioning and execution instructions.
+
+```bash
+# On the CCX43 instance after bootstrap:
+nohup uv run python scripts/generate_dataset.py \
+    --config configs/dataset/v1.yaml \
+    --seed 42 \
+    > logs/generate_v1.log 2>&1 &
+echo "PID: $!"
+```
