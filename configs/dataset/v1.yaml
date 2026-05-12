@@ -6,8 +6,25 @@
 # Override individual fields from the CLI:
 #   ... --override output_dir=data/v1_test target_n=1000
 
+# --- Decision record ---
+# Task 5 profiling (seed=0, 500 attempts per arm) measured:
+#   tabletop_reach:    18.5% (5s), 18.0% (2s)
+#   cluttered_pick:     8.1% (5s),  6.4% (2s)  <- floor, by design
+#   obstacle_avoidance: 12.7% (5s), 12.7% (2s)
+#   Overall:           13.2% (5s), 12.4% (2s)
+#
+# All templates triggered the halt-gate (< 20%). The cluttered_pick floor is
+# intentional: dense placement is the whole point of that template. Tuning it
+# toward 20% would collapse difficulty stratification and undermine the
+# "does the model handle clutter" evaluation in Week 5.
+#
+# Decision (Option B): 15k target, 2s budget, 4 workers (6 cores; 4 workers
+# avoids oversubscription). Projected wall-clock: ~8h.
+# If Week 5 shows more data is needed, extend with seed offsets on cloud.
+# See artifacts/validator_profile.md for full measurement record.
+
 # --- Target ---
-target_n: 50000
+target_n: 15000
 output_dir: "data/v1"
 
 # --- Template mix (must sum to 1.0) ---
@@ -17,16 +34,17 @@ mix:
   obstacle_avoidance: 0.30
 
 # --- Validator ---
-rrt_budget_s: 5.0       # BiRRT wall-clock budget per scene (seconds)
+rrt_budget_s: 2.0       # BiRRT wall-clock budget per scene (seconds)
+                        # 2s vs 5s: 0.8pp acceptance penalty, 1.8x throughput gain
 
 # --- Writer ---
 shard_size_mb: 500      # Maximum size of each .tar shard
 
 # --- Generation ---
 num_workers: 4          # ProcessPoolExecutor workers (each holds one SceneValidator)
+                        # 4 workers on 6 cores avoids oversubscription; tested at 0.54 acc/s
 batch_size: 64          # Candidates sampled and dispatched per round
 # Hard stop: if total attempts exceed target_n * max_attempts_multiplier, halt with error.
-# A multiplier of 10 allows a 90% overall rejection rate before halting.
 max_attempts_multiplier: 10
 
 # --- W&B ---
@@ -34,4 +52,4 @@ wandb:
   enabled: false        # Set to true for production; requires WANDB_API_KEY
   project: "demiurge"
   entity: null          # null = use default entity from wandb login
-  tags: ["data", "v1"]
+  tags: ["data", "v1", "15k", "2s_budget"]
