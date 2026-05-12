@@ -30,10 +30,14 @@
 2. Select your project (or create one named `demiurge`)
 3. Click **Add Server**
 4. Configure:
-   - **Location:** Falkenstein (FSN1) or Nuremberg (NBG1) -- pick whichever is available
+   - **Location:** Ashburn (ASH, US East) or Hillsboro (HIL, US West -- closer to Oakland).
+     Use EU locations (Falkenstein FSN1, Nuremberg NBG1) only as fallbacks if US capacity
+     is unavailable. EU adds transatlantic rsync time (~30-60 min extra for ~50 GB).
    - **Image:** Ubuntu 24.04
    - **Type:** Dedicated vCPU > **CCX43** (16 vCPU, 64 GB, NVMe)
-     - If CCX43 is sold out: fall back to **CCX33** (8 vCPU, 32 GB) and reduce `num_workers` to 7 in `configs/dataset/v1.yaml`
+     - If CCX43 is sold out in your chosen location: try the other US location first,
+       then fall back to **CCX33** (8 vCPU, 32 GB) and reduce `num_workers` to 7
+       in `configs/dataset/v1.yaml`
    - **SSH Keys:** select your uploaded key
    - **Name:** `demiurge-gen`
 5. Click **Create & Buy Now**
@@ -48,7 +52,7 @@ hcloud server create \
     --name demiurge-gen \
     --type ccx43 \
     --image ubuntu-24.04 \
-    --location fsn1 \
+    --location ash \
     --ssh-key <your-ssh-key-name>
 
 # Get the IP
@@ -57,7 +61,38 @@ hcloud server describe demiurge-gen | grep "Public Net"
 
 > [!NOTE]
 > CCX43 Hetzner type string is `ccx43`. CCX33 fallback is `ccx33`.
-> Run `hcloud server-type list` to confirm availability in your chosen location.
+> US locations: `ash` (Ashburn, VA) and `hil` (Hillsboro, OR).
+> EU fallbacks: `fsn1` (Falkenstein) and `nbg1` (Nuremberg).
+> Run `hcloud server-type list` and `hcloud location list` to confirm availability.
+
+---
+
+## GitHub Authentication
+
+The repository is **public** on GitHub. `cloud_setup.sh` uses HTTPS:
+
+```
+REPO_URL="https://github.com/Galanafai/Demiurge.git"
+```
+
+No credentials or SSH keys are needed on the cloud instance. `git clone` and
+`git pull` work without any auth setup.
+
+**Why not SSH?** SSH requires uploading a deploy key to the instance and registering
+it on GitHub -- an extra provisioning step that can fail silently (wrong permissions,
+`known_hosts` not populated). HTTPS with a public repo is simpler, faster, and has
+no security tradeoff: the repository contains no credentials, private data, or
+instance IPs.
+
+**If the repo is ever made private:** switch `REPO_URL` in `cloud_setup.sh` to
+`git@github.com:Galanafai/Demiurge.git` and add the following before the clone step:
+
+```bash
+# Copy deploy key to instance first:
+# scp ~/.ssh/demiurge_deploy_key root@<INSTANCE_IP>:~/.ssh/id_ed25519
+chmod 600 ~/.ssh/id_ed25519
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+```
 
 ---
 
@@ -68,8 +103,7 @@ hcloud server describe demiurge-gen | grep "Public Net"
 ssh root@<INSTANCE_IP>
 ```
 
-Once connected, run the bootstrap script. The recommended approach is to paste
-the script directly (avoids git auth for a private repo) or use scp:
+Once connected, run the bootstrap script. Use `scp` to copy it to the instance:
 
 ```bash
 # On your LOCAL machine:

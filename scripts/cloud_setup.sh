@@ -33,7 +33,8 @@ set -euo pipefail
 # Configuration -- edit these before running if you fork this repo.
 # ---------------------------------------------------------------------------
 
-REPO_URL="https://github.com/Galanafai/Demiurge.git"   # Replace with your fork URL
+REPO_URL="https://github.com/Galanafai/Demiurge.git"   # Public HTTPS -- no auth required
+                                                        # Repo is public; SSH key setup unnecessary
 REPO_BRANCH="week2/model-arch"
 REPO_DIR="/root/Demiurge"
 UV_VERSION="0.4.29"   # Pin uv to a known-good version.
@@ -95,7 +96,7 @@ apt-get install -y -qq libsdformat-dev 2>/dev/null \
 
 step "uv package manager"
 
-UV_BIN="/root/.cargo/bin/uv"
+UV_BIN="/root/.local/bin/uv"
 if [[ -x "$UV_BIN" ]]; then
     INSTALLED_UV=$("$UV_BIN" --version 2>/dev/null | awk '{print $2}' || echo "unknown")
     log "uv already installed: $INSTALLED_UV"
@@ -104,9 +105,11 @@ else
     curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 fi
 
-# Ensure uv is on PATH for subsequent steps.
-export PATH="/root/.cargo/bin:$PATH"
+# Modern astral.sh installer (canonical since uv 0.2+) puts the binary in
+# ~/.local/bin, not ~/.cargo/bin. The cargo path was for older releases.
+export PATH="/root/.local/bin:$PATH"
 uv --version
+log "uv binary: $(which uv)"
 
 # ---------------------------------------------------------------------------
 # Step 3: Clone or update repository
