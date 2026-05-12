@@ -1,0 +1,37 @@
+# Production dataset configuration for Demiurge v1.
+#
+# Pass to generate_dataset.py via --config:
+#   uv run python scripts/generate_dataset.py --config configs/dataset/v1.yaml --seed 42
+#
+# Override individual fields from the CLI:
+#   ... --override output_dir=data/v1_test target_n=1000
+
+# --- Target ---
+target_n: 50000
+output_dir: "data/v1"
+
+# --- Template mix (must sum to 1.0) ---
+mix:
+  tabletop_reach: 0.40
+  cluttered_pick: 0.30
+  obstacle_avoidance: 0.30
+
+# --- Validator ---
+rrt_budget_s: 5.0       # BiRRT wall-clock budget per scene (seconds)
+
+# --- Writer ---
+shard_size_mb: 500      # Maximum size of each .tar shard
+
+# --- Generation ---
+num_workers: 4          # ProcessPoolExecutor workers (each holds one SceneValidator)
+batch_size: 64          # Candidates sampled and dispatched per round
+# Hard stop: if total attempts exceed target_n * max_attempts_multiplier, halt with error.
+# A multiplier of 10 allows a 90% overall rejection rate before halting.
+max_attempts_multiplier: 10
+
+# --- W&B ---
+wandb:
+  enabled: false        # Set to true for production; requires WANDB_API_KEY
+  project: "demiurge"
+  entity: null          # null = use default entity from wandb login
+  tags: ["data", "v1"]
