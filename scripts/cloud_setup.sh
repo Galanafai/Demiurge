@@ -55,6 +55,16 @@ step "System packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 
+# Ubuntu 24.04 ships Python 3.12 by default. Demiurge requires Python 3.11
+# (pyproject.toml: requires-python = ">=3.11,<3.12"). Add the deadsnakes PPA
+# so python3.11 is resolvable before the main install loop.
+if ! dpkg -s python3.11 &>/dev/null 2>&1; then
+    log "Adding deadsnakes PPA for Python 3.11"
+    apt-get install -y -qq software-properties-common
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update -qq
+fi
+
 PACKAGES=(
     git
     curl
