@@ -39,15 +39,12 @@ _TYPE_COLOR: dict[int, str] = {
     5: "brown",        # mustard_bottle
     6: "white",        # sugar_box
     7: "silver",       # tomato_soup_can
-    # Week 2.5 expansion: 8 new distinct colors for IDs 8-15.
+    # Week 2.5 expansion: 4 new YCB entries kept after profiling (IDs 8-11).
+    # IDs 12-15 (purple, beige, navy, olive) dropped; see validator_profile.md.
     8:  "teal",        # bleach_cleanser
     9:  "pink",        # banana
     10: "grey",        # master_chef_can
     11: "lime",        # gelatin_box
-    12: "purple",      # pudding_box
-    13: "beige",       # cracker_box
-    14: "navy",        # potted_meat_can
-    15: "olive",       # power_drill
 }
 
 

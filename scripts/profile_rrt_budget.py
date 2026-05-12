@@ -2,13 +2,20 @@
 """Profile RRT budget impact on per-template acceptance rates.
 
 Runs the generation pipeline twice (5s and 2s RRT budgets) on 500-scene
-smoke runs and prints the decision-gate table required by Task 5.
+smoke runs and prints the full decision-gate table required by Task 2.
+
+Outputs per run:
+  - Per-template acceptance rates (both budgets)
+  - Per-check rejection breakdown (no_interpenetration, stable_rest,
+    ik_reachable, rrt_solvable) across all attempts
+  - Mean elapsed time per candidate (whole scene, not just accepted)
+  - Wall-clock projection for 50k scenes on target hardware
 
 Decision gates:
-  < 20% acceptance per template at 2s -> use 5s budget
-  20-30% acceptance per template at 2s -> proceed with flag
-  > 30% acceptance per template at 2s -> use 2s budget (2.5x throughput gain)
-  Total wall-clock projection > 12h for 50k scenes -> reduce target to 25k/30k
+  < 20% acceptance per template at 2s -> HALT: surface before Task 3
+  20-30% acceptance per template at 2s -> FLAG: proceed with note
+  > 30% acceptance per template at 2s -> proceed clean
+  50k projection > 12h on CCX33 (7 workers) -> surface as anomalous
 
 Usage:
     uv run python scripts/profile_rrt_budget.py \\
@@ -16,8 +23,7 @@ Usage:
         --seed 0
 
 Output:
-    Prints a CSV-formatted result table to stdout and a human summary to stderr.
-    The CSV is written to <output_dir>/profile_results.csv for later reference.
+    Full table printed to stdout; CSV written to <output_dir>/profile_results.csv.
 """
 
 from __future__ import annotations
@@ -26,9 +32,11 @@ import argparse
 import concurrent.futures
 import csv
 import logging
+import math
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -46,20 +54,39 @@ from data.sampler import (  # noqa: E402
     ProceduralSampler,
     TabletopReachTemplate,
 )
+from validator.core import ValidityReport  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 _BUDGETS = [5.0, 2.0]
 _FAMILIES = ["tabletop_reach", "cluttered_pick", "obstacle_avoidance"]
+_CHECKS = ["no_interpenetration", "stable_rest", "ik_reachable", "rrt_solvable"]
+
+# CCX33 hardware parameters for wall-clock projection.
+_CCX33_WORKERS = 7      # 8 dedicated AMD cores minus 1 for OS / writer
+_LAPTOP_WORKERS = 4     # measured workers in the 8-vocab profile run
 
 
-def _run_arm(
-    budget_s: float,
-    cfg: dict,
-    seed: int,
-    n: int,
-) -> tuple[Counter, Counter, float]:
-    """Run one budget arm and return (attempts, accepted, elapsed_s)."""
+@dataclass
+class ArmResult:
+    """Aggregated statistics for one (budget, n_attempts) profiling arm."""
+
+    budget_s: float
+    attempts: Counter = field(default_factory=Counter)       # by template family
+    accepted: Counter = field(default_factory=Counter)       # by template family
+    check_pass: Counter = field(default_factory=Counter)     # by check name (all attempts)
+    check_fail_first: Counter = field(default_factory=Counter)  # first failing check per scene
+    elapsed_total_s: float = 0.0   # total wall-clock (arm level)
+    candidate_elapsed_s: list[float] = field(default_factory=list)  # per-candidate elapsed_s
+
+
+# ---------------------------------------------------------------------------
+# Arm runner
+# ---------------------------------------------------------------------------
+
+
+def _run_arm(budget_s: float, cfg: dict, seed: int, n: int) -> ArmResult:
+    """Run one budget arm and return an ArmResult with full stats."""
     mix_cfg = cfg.get("mix", {})
     templates = [
         TabletopReachTemplate(),
@@ -76,8 +103,7 @@ def _run_arm(
     batch_size: int = int(cfg.get("batch_size", 32))
     num_workers: int = int(cfg.get("num_workers", 4))
 
-    template_attempts: Counter = Counter()
-    template_accepted: Counter = Counter()
+    result = ArmResult(budget_s=budget_s)
     total_attempts = 0
     start = time.monotonic()
 
@@ -98,127 +124,265 @@ def _run_arm(
             }
             for future, candidate in futures.items():
                 try:
-                    report = future.result()
+                    report: ValidityReport = future.result()
                 except Exception as exc:
                     logger.warning("Validation raised: %s", exc)
-                else:
-                    template_attempts[candidate.task_family] += 1
-                    if report.accepted:
-                        template_accepted[candidate.task_family] += 1
+                    total_attempts += 1
+                    continue
+
+                fam = candidate.task_family
+                result.attempts[fam] += 1
+                if report.accepted:
+                    result.accepted[fam] += 1
+
+                # Per-check pass tracking.
+                for check in _CHECKS:
+                    if getattr(report, check):
+                        result.check_pass[check] += 1
+
+                # First failing check (sequential: interp -> stable -> ik -> rrt).
+                first_fail = None
+                for check in _CHECKS:
+                    if not getattr(report, check):
+                        first_fail = check
+                        break
+                if first_fail is not None:
+                    result.check_fail_first[first_fail] += 1
+
+                # Per-candidate elapsed time (includes RRT timeout cost).
+                if not math.isnan(report.elapsed_s):
+                    result.candidate_elapsed_s.append(report.elapsed_s)
+
                 total_attempts += 1
 
-    elapsed = time.monotonic() - start
-    return template_attempts, template_accepted, elapsed
+    result.elapsed_total_s = time.monotonic() - start
+    return result
 
 
-def _print_decision_table(
-    results: dict,
-    target_n: int,
-) -> None:
-    """Print the decision-gate table and projection."""
-    print("\n=== RRT Budget Profiling Results ===\n")
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+
+def _print_acceptance_table(results: dict[float, ArmResult]) -> None:
+    print("\n=== Acceptance Rates ===\n")
     header = (
         f"{'Template':<22} "
         f"{'5s Att':>8} {'5s Acc':>8} {'5s Rate':>8}  "
         f"{'2s Att':>8} {'2s Acc':>8} {'2s Rate':>8}  "
-        f"{'Decision'}"
+        f"{'Gate'}"
     )
     print(header)
     print("-" * len(header))
 
+    halt_triggered = False
     for family in _FAMILIES:
         r5 = results[5.0]
         r2 = results[2.0]
-        att5 = r5["attempts"][family]
-        acc5 = r5["accepted"][family]
+        att5 = r5.attempts[family]
+        acc5 = r5.accepted[family]
         rate5 = acc5 / att5 if att5 > 0 else 0.0
-        att2 = r2["attempts"][family]
-        acc2 = r2["accepted"][family]
+        att2 = r2.attempts[family]
+        acc2 = r2.accepted[family]
         rate2 = acc2 / att2 if att2 > 0 else 0.0
 
         if rate2 < 0.20:
-            decision = "USE 5s (2s < 20%)"
+            gate = "HALT (<20%)"
+            halt_triggered = True
         elif rate2 < 0.30:
-            decision = "FLAG (2s 20-30%)"
+            gate = "FLAG (20-30%)"
         else:
-            decision = "USE 2s (>30%)"
+            gate = "OK (>30%)"
 
         print(
             f"  {family:<20} "
             f"{att5:>8,d} {acc5:>8,d} {rate5:>7.1%}  "
             f"{att2:>8,d} {acc2:>8,d} {rate2:>7.1%}  "
-            f"{decision}"
+            f"{gate}"
         )
 
-    # Wall-clock projection.
     for budget in _BUDGETS:
         r = results[budget]
-        elapsed = r["elapsed_s"]
-        n_sampled = sum(r["attempts"].values())
-        n_accepted = sum(r["accepted"].values())
-        rate = n_accepted / n_sampled if n_sampled > 0 else 0.0
-        # Time to generate target_n at this acceptance rate and throughput.
-        scenes_per_s = n_accepted / elapsed if elapsed > 0 else 0.001
-        projected_s = target_n / (scenes_per_s * max(rate, 1e-6) / rate)
-        projected_h = projected_s / 3600
-        flag = "EXCEED 12h" if projected_h > 12 else "OK"
+        total_att = sum(r.attempts.values())
+        total_acc = sum(r.accepted.values())
+        rate = total_acc / total_att if total_att > 0 else 0.0
+        print(f"  {'TOTAL':<20} {'':>8} {'':>8} {'':>8}  {total_att:>8,d} {total_acc:>8,d} {rate:>7.1%}  (overall, {budget}s)")
+
+    return halt_triggered
+
+
+def _print_rejection_breakdown(results: dict[float, ArmResult]) -> None:
+    print("\n=== Per-Check Rejection Breakdown ===\n")
+    for budget in _BUDGETS:
+        r = results[budget]
+        total_att = sum(r.attempts.values())
+        print(f"  Budget {budget}s  (n_attempts={total_att:,d})")
+        print(f"  {'Check':<24} {'Pass':>8} {'Pass%':>8} {'First-fail':>12}")
+        print(f"  {'-'*55}")
+        for check in _CHECKS:
+            passes = r.check_pass[check]
+            pct = passes / total_att if total_att > 0 else 0.0
+            first_fail = r.check_fail_first[check]
+            print(f"  {check:<24} {passes:>8,d} {pct:>7.1%}  {first_fail:>12,d}")
+        # Error-exception count.
+        exception_count = total_att - sum(r.attempts.values())
+        if exception_count > 0:
+            print(f"  {'exception':24} {exception_count:>8,d}")
+        print()
+
+
+def _print_timing(results: dict[float, ArmResult]) -> None:
+    print("=== Candidate Timing ===\n")
+    for budget in _BUDGETS:
+        r = results[budget]
+        et = r.candidate_elapsed_s
+        if not et:
+            print(f"  {budget}s: no timing data")
+            continue
+        mean_t = sum(et) / len(et)
+        et_sorted = sorted(et)
+        p50 = et_sorted[len(et_sorted) // 2]
+        p95 = et_sorted[int(len(et_sorted) * 0.95)]
+        p99 = et_sorted[min(int(len(et_sorted) * 0.99), len(et_sorted) - 1)]
         print(
-            f"\n  {budget}s budget: "
-            f"acceptance_rate={rate:.1%}, "
-            f"throughput={scenes_per_s:.2f} accepted/s, "
-            f"projected={projected_h:.1f}h for {target_n:,d} scenes  [{flag}]"
+            f"  {budget}s budget: mean={mean_t:.3f}s  p50={p50:.3f}s  "
+            f"p95={p95:.3f}s  p99={p99:.3f}s  "
+            f"(n={len(et):,d} candidates)"
         )
+
+
+def _print_cloud_projection(results: dict[float, ArmResult], target_n: int) -> None:
+    """Project wall-clock time for target_n scenes on CCX33 (7 workers)."""
+    print("\n=== Wall-Clock Projection ===\n")
+    print(f"  Target:  {target_n:,d} accepted scenes")
+    print(f"  Hardware: Hetzner CCX33 (8 dedicated AMD cores, {_CCX33_WORKERS} workers)")
+    print(f"  Measured: laptop (6 cores, {_LAPTOP_WORKERS} workers)\n")
+
+    # Laptop throughput -> CCX33 throughput.
+    # Assumption: throughput scales linearly with workers (conservative; cache effects
+    # on dedicated cores may improve this). We do NOT apply a clock-speed multiplier;
+    # the worker-count ratio is the only adjustment, which is verifiable.
+    worker_scale = _CCX33_WORKERS / _LAPTOP_WORKERS
+
+    halt_triggered = False
+    for budget in _BUDGETS:
+        r = results[budget]
+        total_att = sum(r.attempts.values())
+        total_acc = sum(r.accepted.values())
+        rate = total_acc / total_att if total_att > 0 else 0.0
+        # Laptop: accepted/s observed
+        laptop_acc_per_s = total_acc / r.elapsed_total_s if r.elapsed_total_s > 0 else 0.001
+        # CCX33 projection (linear worker scale)
+        cloud_acc_per_s = laptop_acc_per_s * worker_scale
+        projected_s = target_n / cloud_acc_per_s
+        projected_h = projected_s / 3600
+
+        if projected_h > 12:
+            gate = "ANOMALOUS (>12h): halt, surface before Task 3"
+            halt_triggered = True
+        elif projected_h > 8:
+            gate = "FLAG (8-12h)"
+        else:
+            gate = "OK (<8h)"
+
+        print(
+            f"  {budget}s budget:\n"
+            f"    acceptance_rate    = {rate:.1%}\n"
+            f"    laptop_throughput  = {laptop_acc_per_s:.3f} acc/s "
+            f"({_LAPTOP_WORKERS} workers)\n"
+            f"    cloud_throughput   = {cloud_acc_per_s:.3f} acc/s "
+            f"({_CCX33_WORKERS} workers, {worker_scale:.2f}x scale)\n"
+            f"    projected_50k      = {projected_h:.1f}h  [{gate}]\n"
+        )
+
+    return halt_triggered
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    parser = argparse.ArgumentParser(description="Profile RRT budget impact.")
+    parser = argparse.ArgumentParser(description="Profile RRT budget impact (Task 2).")
     parser.add_argument("--config", required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--target-n", type=int, default=50000,
+        help="Target scene count for wall-clock projection (default: 50000)",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
     n: int = int(cfg.get("target_n", 500))
-    target_50k: int = 50000
 
-    results: dict = {}
+    results: dict[float, ArmResult] = {}
     for budget in _BUDGETS:
         logger.info("Running arm: rrt_budget_s=%.1f, n=%d", budget, n)
-        attempts, accepted, elapsed = _run_arm(budget, cfg, args.seed, n)
-        results[budget] = {
-            "attempts": attempts,
-            "accepted": accepted,
-            "elapsed_s": elapsed,
-        }
+        result = _run_arm(budget, cfg, args.seed, n)
+        results[budget] = result
+        total_acc = sum(result.accepted.values())
+        total_att = sum(result.attempts.values())
         logger.info(
             "Arm %.1fs done: accepted=%d/%d in %.0fs",
-            budget, sum(accepted.values()), sum(attempts.values()), elapsed,
+            budget, total_acc, total_att, result.elapsed_total_s,
         )
 
-    _print_decision_table(results, target_50k)
+    # Print full report.
+    halt_accept = _print_acceptance_table(results)
+    _print_rejection_breakdown(results)
+    _print_timing(results)
+    halt_proj = _print_cloud_projection(results, args.target_n)
 
-    # Write CSV for reproducibility.
+    # Gate summary.
+    print("=== Gate Summary ===\n")
+    if halt_accept:
+        print("  HALT: one or more templates below 20% at 2s budget.")
+        print("  Do not proceed to Task 3 without user review.")
+    elif halt_proj:
+        print("  HALT: 50k projection exceeds 12h. Likely acceptance-rate regression.")
+        print("  Do not proceed to Task 3 without user review.")
+    else:
+        print("  All gates PASSED. Await user review before Task 3.")
+
+    # Write CSV.
     output_dir = Path(cfg.get("output_dir", "data/profile_500"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "profile_results.csv"
-    with csv_path.open("w", newline="") as f:
-        writer = csv.writer(f)
+    csv_path = output_dir / "profile_results_16vocab.csv"
+    with csv_path.open("w", newline="") as f_csv:
+        writer = csv.writer(f_csv)
         writer.writerow([
-            "budget_s", "template", "attempts", "accepted", "rate", "elapsed_s"
+            "budget_s", "template", "attempts", "accepted", "rate",
+            "check_interp_pass", "check_stable_pass", "check_ik_pass", "check_rrt_pass",
+            "mean_elapsed_s", "elapsed_total_s",
         ])
         for budget in _BUDGETS:
             r = results[budget]
+            total_att = sum(r.attempts.values())
+            mean_t = (
+                sum(r.candidate_elapsed_s) / len(r.candidate_elapsed_s)
+                if r.candidate_elapsed_s else float("nan")
+            )
             for family in _FAMILIES:
-                att = r["attempts"][family]
-                acc = r["accepted"][family]
+                att = r.attempts[family]
+                acc = r.accepted[family]
                 rate = acc / att if att > 0 else 0.0
-                writer.writerow([budget, family, att, acc, f"{rate:.4f}", f"{r['elapsed_s']:.1f}"])
+                writer.writerow([
+                    budget, family, att, acc, f"{rate:.4f}",
+                    r.check_pass["no_interpenetration"],
+                    r.check_pass["stable_rest"],
+                    r.check_pass["ik_reachable"],
+                    r.check_pass["rrt_solvable"],
+                    f"{mean_t:.3f}",
+                    f"{r.elapsed_total_s:.1f}",
+                ])
     logger.info("Results written to %s", csv_path)
 
-    return 0
+    return 1 if (halt_accept or halt_proj) else 0
 
 
 if __name__ == "__main__":

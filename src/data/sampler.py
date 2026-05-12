@@ -121,6 +121,43 @@ def _random_yaw_quat(rng: np.random.Generator) -> list[float]:
     return [math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)]
 
 
+def _sample_orientation(type_id: int, rng: np.random.Generator) -> list[float]:
+    """Sample a quaternion for the given object type.
+
+    For upright_constrained entries, always returns a yaw-only quaternion and
+    asserts no roll or pitch was introduced. This is trivially true with the
+    current yaw-only implementation but defends against future SO(3) changes.
+
+    For unconstrained entries, also returns yaw-only for now. The separation
+    makes future SO(3) augmentation safe: only unconstrained entries would be
+    eligible for full-rotation sampling. Any such change must update this
+    function and the corresponding tests.
+
+    Args:
+        type_id: Integer object type ID from ObjectTypeId.
+        rng: Numpy random generator. Mutated in place.
+
+    Returns:
+        Quaternion [w, x, y, z] as a list of floats.
+
+    Raises:
+        AssertionError: If an upright_constrained entry receives a quaternion
+            with nonzero roll or pitch. Should never fire under normal use.
+    """
+    entry = OBJECT_VOCAB[type_id]
+    q = _random_yaw_quat(rng)
+    if entry.upright_constrained:
+        # q[1]=x, q[2]=y must be zero for a pure yaw rotation.
+        if abs(q[1]) >= 1e-9 or abs(q[2]) >= 1e-9:
+            raise AssertionError(
+                f"upright_constrained entry {entry.name!r} (id={type_id}) "
+                f"received a quaternion with nonzero roll/pitch: q={q}. "
+                "Only yaw rotations are permitted for this entry."
+            )
+    return q
+
+
+
 def _build_scene_tensor(
     type_ids: list[int],
     xyzs: list[np.ndarray],
@@ -244,7 +281,7 @@ class TabletopReachTemplate:
         n_vocab = len(OBJECT_VOCAB)
         type_ids = [int(rng.integers(0, n_vocab)) for _ in range(n)]
         scales = [float(rng.uniform(0.8, 1.2)) for _ in range(n)]
-        quats = [_random_yaw_quat(rng) for _ in range(n)]
+        quats = [_sample_orientation(type_ids[j], rng) for j in range(n)]
 
         b = self.bounds
         xyzs, placed = _place_objects(
@@ -328,7 +365,7 @@ class ClutteredPickTemplate:
         n_vocab = len(OBJECT_VOCAB)
         type_ids = [int(rng.integers(0, n_vocab)) for _ in range(n)]
         scales = [float(rng.uniform(0.8, 1.1)) for _ in range(n)]
-        quats = [_random_yaw_quat(rng) for _ in range(n)]
+        quats = [_sample_orientation(type_ids[j], rng) for j in range(n)]
 
         xyzs, placed = _place_objects(
             rng, n, type_ids, scales,
@@ -416,7 +453,7 @@ class ObstacleAvoidanceTemplate:
 
         barrier_type_ids = [int(rng.integers(0, n_vocab)) for _ in range(n_barriers)]
         barrier_scales = [float(rng.uniform(0.8, 1.2)) for _ in range(n_barriers)]
-        barrier_quats = [_random_yaw_quat(rng) for _ in range(n_barriers)]
+        barrier_quats = [_sample_orientation(barrier_type_ids[j], rng) for j in range(n_barriers)]
 
         # Place barriers in a row along x, at barrier_y.
         barrier_xyzs, placed_b = _place_objects(
@@ -433,7 +470,7 @@ class ObstacleAvoidanceTemplate:
         # Target: one object beyond the barrier (larger y).
         tgt_type_id = int(rng.integers(0, n_vocab))
         tgt_scale = float(rng.uniform(0.8, 1.2))
-        tgt_quat = _random_yaw_quat(rng)
+        tgt_quat = _sample_orientation(tgt_type_id, rng)
         tgt_hz = _half_height(tgt_type_id, tgt_scale)
         tgt_x = float(rng.uniform(-0.20, 0.20))
         tgt_y = float(rng.uniform(self.target_y_range[0], self.target_y_range[1]))

@@ -249,3 +249,138 @@ class TestProceduralSampler:
         c2 = s2.sample()
         assert c1.task_family == c2.task_family
         assert torch.equal(c1.scene.presence, c2.scene.presence)
+
+
+# ---------------------------------------------------------------------------
+# Upright constraint
+# ---------------------------------------------------------------------------
+
+
+class TestUprightConstraint:
+    """Tests for the upright_constrained flag and _sample_orientation wrapper.
+
+    The four tests below are ordered from data-integrity to behavioral:
+      1. Flag-integrity: vocab data correctness.
+      2. No-tilt: constrained entries never get roll/pitch.
+      3. Current-behaviour: all entries currently produce yaw-only output.
+      4. Template-coverage: templates use _sample_orientation, not _random_yaw_quat.
+    """
+
+    def test_upright_constrained_entries_flagged_by_hz_threshold(self) -> None:
+        """Data-integrity: every entry with hz > 0.10m has upright_constrained=True.
+
+        This is duplicated from TestNewYcbEntries to provide a single-class
+        location for all upright-constraint invariants. If this test fails,
+        an entry was added to OBJECT_VOCAB without setting the flag.
+        """
+        from scene.vocab import OBJECT_VOCAB
+
+        for tid, entry in OBJECT_VOCAB.items():
+            hz = entry.canonical_half_extents_m[2]
+            if hz > 0.10:
+                assert entry.upright_constrained, (
+                    f"{entry.name} (id={tid}) hz={hz:.3f}m > 0.10m "
+                    f"but upright_constrained=False"
+                )
+            else:
+                assert not entry.upright_constrained, (
+                    f"{entry.name} (id={tid}) hz={hz:.3f}m <= 0.10m "
+                    f"but upright_constrained=True (wrong threshold?)"
+                )
+
+    def test_sample_orientation_constrained_never_tilts(self) -> None:
+        """Constrained entries: 1000 samples all have cos(angle to Z) >= 0.9999.
+
+        cos(angle) = R[2,2] = 1 - 2*(qx^2 + qy^2) for wxyz quaternion.
+        0.9999 corresponds to ~0.81 degrees of tilt; practically zero.
+        """
+        from data.sampler import _sample_orientation
+        from scene.vocab import OBJECT_VOCAB
+
+        constrained_ids = [
+            int(tid)
+            for tid, entry in OBJECT_VOCAB.items()
+            if entry.upright_constrained
+        ]
+        assert constrained_ids, "No upright_constrained entries found; check vocab."
+
+        rng = _rng(0)
+        for type_id in constrained_ids:
+            entry = OBJECT_VOCAB[type_id]
+            for _ in range(1000):
+                q = _sample_orientation(type_id, rng)
+                w, qx, qy, qz = q
+                # R[2,2] = 1 - 2*(qx^2 + qy^2) for a unit quaternion.
+                cos_angle_to_z = 1.0 - 2.0 * (qx**2 + qy**2)
+                assert cos_angle_to_z >= 0.9999, (
+                    f"{entry.name}: cos(angle_to_Z)={cos_angle_to_z:.6f} < 0.9999 "
+                    f"(tilt detected), q={q}"
+                )
+
+    def test_sample_orientation_unconstrained_currently_yaw_only(self) -> None:
+        """Documentation: unconstrained entries also produce yaw-only output now.
+
+        This test documents current behaviour. If SO(3) augmentation is added
+        for unconstrained entries in a future sampler, this test is expected to
+        change (and must be updated deliberately, not silently fixed).
+        """
+        from data.sampler import _sample_orientation
+        from scene.vocab import OBJECT_VOCAB
+
+        unconstrained_ids = [
+            int(tid)
+            for tid, entry in OBJECT_VOCAB.items()
+            if not entry.upright_constrained
+        ]
+        assert unconstrained_ids, "All entries are constrained; expected some unconstrained."
+
+        rng = _rng(1)
+        for type_id in unconstrained_ids:
+            for _ in range(100):
+                q = _sample_orientation(type_id, rng)
+                _w, qx, qy, _qz = q
+                assert abs(qx) < 1e-9, f"type_id={type_id}: qx={qx} (roll detected)"
+                assert abs(qy) < 1e-9, f"type_id={type_id}: qy={qy} (pitch detected)"
+
+    def test_all_templates_use_sample_orientation(self) -> None:
+        """Template-coverage: _sample_orientation is called for every placed object.
+
+        Uses unittest.mock.patch to intercept calls and verify type_ids passed
+        match the scene tensor's object_types for present objects.
+        """
+        from unittest.mock import patch
+
+        import data.sampler as sampler_mod
+        from data.sampler import _sample_orientation as real_fn
+
+        templates = [
+            TabletopReachTemplate(),
+            ClutteredPickTemplate(),
+            ObstacleAvoidanceTemplate(),
+        ]
+        for template in templates:
+            called_type_ids: list[int] = []
+
+            def _recording_sample_orientation(
+                type_id: int, rng: np.random.Generator
+            ) -> list[float]:
+                called_type_ids.append(type_id)
+                return real_fn(type_id, rng)
+
+            with patch.object(sampler_mod, "_sample_orientation", _recording_sample_orientation):
+                rng = _rng(7)
+                for _ in range(10):
+                    c = template.sample_scene(rng)
+                    # Every present object's type must appear in called_type_ids.
+                    # (called_type_ids includes pre-filter samples, so we only
+                    # verify at least one call matched each present type_id.)
+                    present_types = {
+                        int(c.scene.object_types[i].item())
+                        for i in range(len(c.scene.presence))
+                        if c.scene.presence[i].item()
+                    }
+                    assert present_types.issubset(set(called_type_ids)), (
+                        f"{template.name}: present type_ids {present_types} "
+                        f"not covered by _sample_orientation calls {set(called_type_ids)}"
+                    )
+                    called_type_ids.clear()

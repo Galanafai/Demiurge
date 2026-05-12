@@ -6,8 +6,8 @@ from scene.vocab import OBJECT_VOCAB, ObjectTypeId, build_sdf
 
 
 class TestVocabLength:
-    def test_vocab_has_sixteen_entries(self) -> None:
-        assert len(OBJECT_VOCAB) == 16
+    def test_vocab_has_twelve_entries(self) -> None:
+        assert len(OBJECT_VOCAB) == 12
 
     def test_all_type_ids_present(self) -> None:
         for tid in ObjectTypeId:
@@ -88,10 +88,6 @@ _NEW_ENTRY_IDS = [
     ObjectTypeId.BANANA,
     ObjectTypeId.MASTER_CHEF_CAN,
     ObjectTypeId.GELATIN_BOX,
-    ObjectTypeId.PUDDING_BOX,
-    ObjectTypeId.CRACKER_BOX,
-    ObjectTypeId.POTTED_MEAT_CAN,
-    ObjectTypeId.POWER_DRILL,
 ]
 
 
@@ -150,9 +146,30 @@ class TestNewYcbEntries:
             f"Entry name {entry.name!r} != enum name {expected_name!r} for id={type_id}"
         )
 
+    def test_upright_constrained_flag_matches_hz_threshold(self) -> None:
+        """Every entry with hz > 0.10m must have upright_constrained=True.
+
+        hz threshold = canonical_half_extents_m[2] > 0.10.
+        Currently only BLEACH_CLEANSER qualifies (hz=0.125m).
+        This test enforces the invariant so future contributors adding
+        tall objects cannot forget to set the flag.
+        """
+        for tid, entry in OBJECT_VOCAB.items():
+            hz = entry.canonical_half_extents_m[2]
+            if hz > 0.10:
+                assert entry.upright_constrained, (
+                    f"{entry.name} (id={tid}) has hz={hz:.3f}m > 0.10m "
+                    f"but upright_constrained=False"
+                )
+            else:
+                assert not entry.upright_constrained, (
+                    f"{entry.name} (id={tid}) has hz={hz:.3f}m <= 0.10m "
+                    f"but upright_constrained=True (check threshold)"
+                )
+
 
 class TestColorMapCoverage:
-    """Verify _TYPE_COLOR covers all 16 vocab entries with distinct values."""
+    """Verify _TYPE_COLOR covers all 12 vocab entries with distinct values."""
 
     def test_color_map_covers_all_type_ids(self) -> None:
         from data.descriptions import _TYPE_COLOR
