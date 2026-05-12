@@ -1,0 +1,172 @@
+<?xml version="1.0"?>
+<!--
+UR5e robot model for the Demiurge Drake validator.
+
+Kinematics follow the Universal Robots UR5e DH parameters:
+  https://www.universal-robots.com/articles/ur/application-installation/dh-parameters-for-calculations-of-kinematics-and-dynamics/
+
+All geometry uses primitive capsule/cylinder approximations. No mesh files are
+referenced. This is intentional: the validator only requires collision geometry
+and kinematic structure, not photorealistic rendering.
+
+Joint limits follow the UR5e datasheet (all joints: +/-360 deg, i.e. 2*pi rad).
+-->
+<robot name="ur5e">
+
+  <!-- ======================================================== -->
+  <!-- Links                                                      -->
+  <!-- ======================================================== -->
+
+  <link name="base_link">
+    <inertial>
+      <mass value="4.0"/>
+      <origin xyz="0 0 0.021" rpy="0 0 0"/>
+      <inertia ixx="0.00443333156" ixy="0" ixz="0"
+               iyy="0.00443333156" iyz="0" izz="0.0072"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0.021" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.042"/></geometry>
+    </collision>
+  </link>
+
+  <link name="shoulder_link">
+    <inertial>
+      <mass value="3.761"/>
+      <origin xyz="0 0 -0.127" rpy="0 0 0"/>
+      <inertia ixx="0.010267495893" ixy="0" ixz="0"
+               iyy="0.010267495893" iyz="0" izz="0.00666"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 -0.06" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.12"/></geometry>
+    </collision>
+  </link>
+
+  <link name="upper_arm_link">
+    <inertial>
+      <mass value="8.058"/>
+      <origin xyz="-0.2125 0 0.136" rpy="0 1.5707963267948966 0"/>
+      <inertia ixx="0.22689067591" ixy="0" ixz="0"
+               iyy="0.22689067591" iyz="0" izz="0.02154"/>
+    </inertial>
+    <collision>
+      <origin xyz="-0.2125 0 0.136" rpy="0 1.5707963267948966 0"/>
+      <geometry><cylinder radius="0.06" length="0.425"/></geometry>
+    </collision>
+  </link>
+
+  <link name="forearm_link">
+    <inertial>
+      <mass value="2.846"/>
+      <origin xyz="-0.1961 0 0.016" rpy="0 1.5707963267948966 0"/>
+      <inertia ixx="0.049443313556" ixy="0" ixz="0"
+               iyy="0.049443313556" iyz="0" izz="0.00453"/>
+    </inertial>
+    <collision>
+      <origin xyz="-0.1961 0 0.016" rpy="0 1.5707963267948966 0"/>
+      <geometry><cylinder radius="0.055" length="0.3922"/></geometry>
+    </collision>
+  </link>
+
+  <link name="wrist_1_link">
+    <inertial>
+      <mass value="1.37"/>
+      <origin xyz="0 -0.127 0" rpy="0 0 0"/>
+      <inertia ixx="0.00526655625" ixy="0" ixz="0"
+               iyy="0.00526655625" iyz="0" izz="0.00066"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 -0.06 0" rpy="1.5707963267948966 0 0"/>
+      <geometry><cylinder radius="0.04" length="0.12"/></geometry>
+    </collision>
+  </link>
+
+  <link name="wrist_2_link">
+    <inertial>
+      <mass value="1.37"/>
+      <origin xyz="0 0 -0.1" rpy="0 0 0"/>
+      <inertia ixx="0.00526655625" ixy="0" ixz="0"
+               iyy="0.00526655625" iyz="0" izz="0.00066"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 -0.06" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.04" length="0.12"/></geometry>
+    </collision>
+  </link>
+
+  <link name="wrist_3_link">
+    <inertial>
+      <mass value="0.1879"/>
+      <origin xyz="0 0 -0.021875" rpy="0 0 0"/>
+      <inertia ixx="9.890410052167399e-05" ixy="0" ixz="0"
+               iyy="9.890410052167399e-05" iyz="0" izz="0.000132"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 -0.01" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.04" length="0.04"/></geometry>
+    </collision>
+  </link>
+
+  <!-- TCP (tool center point) -- massless reference frame -->
+  <link name="tool0"/>
+
+  <!-- ======================================================== -->
+  <!-- Joints                                                     -->
+  <!-- ======================================================== -->
+
+  <joint name="shoulder_pan_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <origin xyz="0 0 0.163" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="150" velocity="3.14"/>
+  </joint>
+
+  <joint name="shoulder_lift_joint" type="revolute">
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <origin xyz="0 0 0" rpy="1.5707963267948966 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="150" velocity="3.14"/>
+  </joint>
+
+  <joint name="elbow_joint" type="revolute">
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <origin xyz="-0.425 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="150" velocity="3.14"/>
+  </joint>
+
+  <joint name="wrist_1_joint" type="revolute">
+    <parent link="forearm_link"/>
+    <child link="wrist_1_link"/>
+    <origin xyz="-0.3922 0 0.1333" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="28" velocity="6.28"/>
+  </joint>
+
+  <joint name="wrist_2_joint" type="revolute">
+    <parent link="wrist_1_link"/>
+    <child link="wrist_2_link"/>
+    <origin xyz="0 -0.0997 0" rpy="1.5707963267948966 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="28" velocity="6.28"/>
+  </joint>
+
+  <joint name="wrist_3_joint" type="revolute">
+    <parent link="wrist_2_link"/>
+    <child link="wrist_3_link"/>
+    <origin xyz="0 0 -0.0996" rpy="-1.5707963267948966 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2832" upper="6.2832" effort="28" velocity="6.28"/>
+  </joint>
+
+  <joint name="wrist_3_to_tool0" type="fixed">
+    <parent link="wrist_3_link"/>
+    <child link="tool0"/>
+    <origin xyz="0 0.0996 0" rpy="1.5707963267948966 0 0"/>
+  </joint>
+
+</robot>

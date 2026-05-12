@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Demiurge project-specific
+wandb/
+/data/
+outputs/
+# Smoke run artifacts are committed; raw large dataset shards are not.
+artifacts/*.tar
+artifacts/*.wds
+# Drake temporary files
+drake_visualizer_*.json

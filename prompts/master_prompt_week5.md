@@ -10,7 +10,7 @@ You are continuing the project. Week 4 produced the headline Pareto plot for val
 
 Before doing anything else:
 
-1. Read `AGENTS.md` and `.agents/skills/diffusion-scene-pipeline/SKILL.md` in full.
+1. Read `AGENTS.md` and `.agents/skills/demiurge/SKILL.md` in full.
 2. Read `artifacts/week4_results.md` and `artifacts/week5_preview.md`.
 3. State in your Plan Artifact: which sampler configurations are advancing to downstream evaluation (typically: unconditional baseline, conditional baseline, rejection sampler, best classifier-guided config), and the rationale.
 

@@ -10,7 +10,7 @@ You are continuing the project. Week 2 produced a 50k-scene sharded dataset with
 
 Before doing anything else:
 
-1. Read `AGENTS.md` and `.agents/skills/diffusion-scene-pipeline/SKILL.md` in full.
+1. Read `AGENTS.md` and `.agents/skills/demiurge/SKILL.md` in full.
 2. Read `artifacts/dataset_v1_card.md` and `artifacts/week3_preview.md` from Week 2.
 3. State in your Plan Artifact: the dataset size, the dimensionality of the SceneTensor, the chosen model size in parameters, and the rationale for that size given dataset scale.
 

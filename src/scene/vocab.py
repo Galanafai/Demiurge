@@ -1,0 +1,261 @@
+"""Object vocabulary for the Demiurge scene schema.
+
+Defines OBJECT_VOCAB: a fixed 8-entry registry mapping integer type IDs to ObjectEntry
+instances. All SDFs are inline geometry strings. The PyPI drake wheel does not ship YCB
+mesh assets, so YCB-keyed entries (IDs 5-7) use primitive approximations with dimensions
+matched to the real YCB objects. This is sufficient for Drake collision and IK checks.
+
+Do not add entries beyond ID 7 without explicit approval (AGENTS.md: fixed vocabulary).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import IntEnum
+
+
+class ObjectTypeId(IntEnum):
+    """Canonical integer IDs for each object type in the vocabulary."""
+
+    CUBE = 0
+    SPHERE = 1
+    CYLINDER = 2
+    BOX_TALL = 3
+    BOX_FLAT = 4
+    MUSTARD_BOTTLE = 5  # YCB 006: approximated as cylinder r=0.03 h=0.19
+    SUGAR_BOX = 6  # YCB 004: approximated as box 0.038 x 0.086 x 0.175
+    TOMATO_SOUP_CAN = 7  # YCB 005: approximated as cylinder r=0.033 h=0.102
+
+
+@dataclass(frozen=True)
+class ObjectEntry:
+    """Metadata for one object type in the vocabulary.
+
+    Attributes:
+        name: Human-readable identifier.
+        bounding_radius_m: Radius of the bounding sphere in metres, used for
+            proximity queries and scale clamping.
+        canonical_half_extents_m: (x, y, z) half-extents of the tightest
+            enclosing axis-aligned box at scale=1. Used to compute inertia
+            tensors and to build the SDF.
+        sdf_template: SDF XML string with format placeholders:
+            {model_name}, {mass}, {sx}, {sy}, {sz} for box,
+            {model_name}, {mass}, {radius}, {length} for cylinder,
+            {model_name}, {mass}, {radius} for sphere.
+        sdf_kind: One of "box", "sphere", "cylinder". Controls which template
+            placeholders are active.
+    """
+
+    name: str
+    bounding_radius_m: float
+    canonical_half_extents_m: tuple[float, float, float]
+    sdf_template: str
+    sdf_kind: str
+
+
+# ---------------------------------------------------------------------------
+# SDF templates
+# ---------------------------------------------------------------------------
+
+_BOX_SDF = """\
+<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="{model_name}">
+    <link name="link">
+      <inertial>
+        <mass>{mass}</mass>
+        <inertia>
+          <ixx>{ixx}</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>{iyy}</iyy><iyz>0</iyz>
+          <izz>{izz}</izz>
+        </inertia>
+      </inertial>
+      <collision name="col">
+        <geometry><box><size>{sx} {sy} {sz}</size></box></geometry>
+      </collision>
+      <visual name="vis">
+        <geometry><box><size>{sx} {sy} {sz}</size></box></geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>"""
+
+_SPHERE_SDF = """\
+<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="{model_name}">
+    <link name="link">
+      <inertial>
+        <mass>{mass}</mass>
+        <inertia>
+          <ixx>{ixx}</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>{iyy}</iyy><iyz>0</iyz>
+          <izz>{izz}</izz>
+        </inertia>
+      </inertial>
+      <collision name="col">
+        <geometry><sphere><radius>{radius}</radius></sphere></geometry>
+      </collision>
+      <visual name="vis">
+        <geometry><sphere><radius>{radius}</radius></sphere></geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>"""
+
+_CYLINDER_SDF = """\
+<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="{model_name}">
+    <link name="link">
+      <inertial>
+        <mass>{mass}</mass>
+        <inertia>
+          <ixx>{ixx}</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>{iyy}</iyy><iyz>0</iyz>
+          <izz>{izz}</izz>
+        </inertia>
+      </inertial>
+      <collision name="col">
+        <geometry><cylinder>
+          <radius>{radius}</radius><length>{length}</length>
+        </cylinder></geometry>
+      </collision>
+      <visual name="vis">
+        <geometry><cylinder>
+          <radius>{radius}</radius><length>{length}</length>
+        </cylinder></geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>"""
+
+# ---------------------------------------------------------------------------
+# Vocabulary entries
+# ---------------------------------------------------------------------------
+
+OBJECT_VOCAB: dict[int, ObjectEntry] = {
+    ObjectTypeId.CUBE: ObjectEntry(
+        name="cube",
+        bounding_radius_m=0.0433,  # half-diagonal of 0.05m cube
+        canonical_half_extents_m=(0.025, 0.025, 0.025),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.SPHERE: ObjectEntry(
+        name="sphere",
+        bounding_radius_m=0.030,
+        canonical_half_extents_m=(0.030, 0.030, 0.030),
+        sdf_template=_SPHERE_SDF,
+        sdf_kind="sphere",
+    ),
+    ObjectTypeId.CYLINDER: ObjectEntry(
+        name="cylinder",
+        bounding_radius_m=0.053,  # sqrt(r^2 + (h/2)^2) for r=0.025, h=0.09
+        canonical_half_extents_m=(0.025, 0.025, 0.045),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+    ),
+    ObjectTypeId.BOX_TALL: ObjectEntry(
+        name="box_tall",
+        bounding_radius_m=0.098,
+        canonical_half_extents_m=(0.025, 0.025, 0.090),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.BOX_FLAT: ObjectEntry(
+        name="box_flat",
+        bounding_radius_m=0.056,
+        canonical_half_extents_m=(0.050, 0.050, 0.015),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    # YCB-keyed entries: inline primitive approximations.
+    # Real YCB meshes are not shipped in the drake PyPI wheel.
+    ObjectTypeId.MUSTARD_BOTTLE: ObjectEntry(
+        name="mustard_bottle",
+        bounding_radius_m=0.098,  # sqrt(0.03^2 + 0.095^2)
+        canonical_half_extents_m=(0.030, 0.030, 0.095),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+    ),
+    ObjectTypeId.SUGAR_BOX: ObjectEntry(
+        name="sugar_box",
+        bounding_radius_m=0.102,  # half-diagonal of 0.038 x 0.086 x 0.175
+        canonical_half_extents_m=(0.019, 0.043, 0.0875),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.TOMATO_SOUP_CAN: ObjectEntry(
+        name="tomato_soup_can",
+        bounding_radius_m=0.062,  # sqrt(0.033^2 + 0.051^2)
+        canonical_half_extents_m=(0.033, 0.033, 0.051),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+    ),
+}
+
+assert len(OBJECT_VOCAB) == 8, "Vocabulary must have exactly 8 entries."
+
+
+def build_sdf(entry: ObjectEntry, model_name: str, scale: float = 1.0, mass: float = 0.5) -> str:
+    """Render an ObjectEntry SDF template at the given uniform scale and mass.
+
+    Inertia tensors are recomputed from the scaled geometry so that Drake's
+    simulator can numerically integrate the scene without poorly conditioned
+    dynamics.
+
+    Args:
+        entry: The ObjectEntry from OBJECT_VOCAB.
+        model_name: Unique model name used as the SDF <model name="...">.
+        scale: Uniform scale factor applied to all geometry dimensions.
+        mass: Mass of the rigid body in kg.
+
+    Returns:
+        Rendered SDF XML string ready for Parser.AddModelsFromString.
+    """
+    hx, hy, hz = (v * scale for v in entry.canonical_half_extents_m)
+    kind = entry.sdf_kind
+
+    if kind == "box":
+        sx, sy, sz = 2 * hx, 2 * hy, 2 * hz
+        ixx = (1.0 / 12.0) * mass * (sy**2 + sz**2)
+        iyy = (1.0 / 12.0) * mass * (sx**2 + sz**2)
+        izz = (1.0 / 12.0) * mass * (sx**2 + sy**2)
+        return entry.sdf_template.format(
+            model_name=model_name,
+            mass=mass,
+            sx=sx,
+            sy=sy,
+            sz=sz,
+            ixx=ixx,
+            iyy=iyy,
+            izz=izz,
+        )
+    elif kind == "sphere":
+        r = hx  # canonical_half_extents_m are equal for sphere
+        ixx = iyy = izz = (2.0 / 5.0) * mass * r**2
+        return entry.sdf_template.format(
+            model_name=model_name,
+            mass=mass,
+            radius=r,
+            ixx=ixx,
+            iyy=iyy,
+            izz=izz,
+        )
+    elif kind == "cylinder":
+        r = hx  # hx == hy for cylinder
+        length = 2 * hz
+        ixx = iyy = (1.0 / 12.0) * mass * (3 * r**2 + length**2)
+        izz = 0.5 * mass * r**2
+        return entry.sdf_template.format(
+            model_name=model_name,
+            mass=mass,
+            radius=r,
+            length=length,
+            ixx=ixx,
+            iyy=iyy,
+            izz=izz,
+        )
+    else:
+        raise ValueError(f"Unknown sdf_kind '{kind}' for entry '{entry.name}'.")

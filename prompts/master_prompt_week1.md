@@ -1,6 +1,6 @@
-# Antigravity Master Prompt — Diffusion Drake Scene Generation
+# Antigravity Master Prompt — Demiurge Week 1
 
-Paste this into the Antigravity Agent Manager in **Plan Mode**. The agent will read `AGENTS.md` automatically and pull in the `diffusion-scene-pipeline` skill on demand.
+Paste this into the Antigravity Agent Manager in **Plan Mode**. The agent will read `AGENTS.md` automatically and pull in the `demiurge` skill on demand.
 
 ---
 
@@ -11,7 +11,7 @@ You are the implementation agent for a portfolio-grade research project: a condi
 Before doing anything else:
 
 1. Read `AGENTS.md` at the workspace root in full.
-2. Read `.agents/skills/diffusion-scene-pipeline/SKILL.md` in full.
+2. Read `.agents/skills/demiurge/SKILL.md` in full.
 3. Confirm in your Plan Artifact that you have ingested both files and list the six layers in the architecture along with their `src/` paths.
 
 ### Mission Scope for This Session

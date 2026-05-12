@@ -11,7 +11,7 @@ You are continuing the diffusion Drake scene generation project. Week 1 delivere
 Before doing anything else:
 
 1. Read `AGENTS.md` at the workspace root in full.
-2. Read `.agents/skills/diffusion-scene-pipeline/SKILL.md` in full.
+2. Read `.agents/skills/demiurge/SKILL.md` in full.
 3. Read `artifacts/week1_smoke.csv` and the Week 1 summary Artifact. State in your Plan Artifact the observed rejection rate per validator check, and which check is the current bottleneck.
 
 ### Mission Scope for This Session

@@ -10,7 +10,7 @@ You are completing the project. Week 5 produced the final results table, ablatio
 
 Before doing anything else:
 
-1. Read `AGENTS.md` and `.agents/skills/diffusion-scene-pipeline/SKILL.md` in full.
+1. Read `AGENTS.md` and `.agents/skills/demiurge/SKILL.md` in full.
 2. Read `artifacts/results_table.md`, `artifacts/ablations.md`, and `artifacts/week6_preview.md`.
 3. State in your Plan Artifact: the headline claim of the project in one sentence, the three supporting metrics that back it, and the audience for the writeup.
 

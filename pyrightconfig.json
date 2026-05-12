@@ -1,0 +1,11 @@
+{
+  "include": ["src", "tests"],
+  "exclude": [".venv", "**/__pycache__"],
+  "strict": ["src/**"],
+  "extraPaths": ["src"],
+  "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false
+}

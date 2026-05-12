@@ -10,7 +10,7 @@ You are continuing the project. Week 3 produced trained unconditional and condit
 
 Before doing anything else:
 
-1. Read `AGENTS.md` and `.agents/skills/diffusion-scene-pipeline/SKILL.md` in full.
+1. Read `AGENTS.md` and `.agents/skills/demiurge/SKILL.md` in full.
 2. Read `artifacts/week3_results.md` and `artifacts/week4_preview.md`.
 3. State in your Plan Artifact: the conditional validity rate from Week 3, the validity-rate gap to close, and the hypothesis for why classifier guidance should close it.
 
