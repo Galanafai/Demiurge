@@ -160,7 +160,6 @@ class SceneValidator:
                 f"UR5e URDF not found at {self._urdf_path}. "
                 "Ensure assets/models/ur5e/ur5e.urdf is present in the repository."
             )
-        self._cache: dict[bytes, ValidityReport] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -169,9 +168,6 @@ class SceneValidator:
     def validate(self, scene: SceneTensor, rrt_seed: int = 0) -> ValidityReport:
         """Run all four validity checks on a scene.
 
-        Results are cached by scene content hash. The cache is not shared across
-        processes; each worker has its own instance.
-
         Args:
             scene: Physical-space SceneTensor (not normalized).
             rrt_seed: Seed for BiRRT; logged in the report for reproducibility.
@@ -179,15 +175,9 @@ class SceneValidator:
         Returns:
             ValidityReport with all fields populated.
         """
-        cache_key = _scene_hash(scene)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
         t0 = time.monotonic()
         report = self._run_checks(scene, rrt_seed)
         report.elapsed_s = time.monotonic() - t0
-
-        self._cache[cache_key] = report
         return report
 
     def validate_batch(

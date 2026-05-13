@@ -28,11 +28,11 @@ Decision gate (per-template acceptance rate):
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import hashlib
 import json
 import logging
 import math
+import multiprocessing
 import subprocess
 import sys
 import time
@@ -73,8 +73,12 @@ _worker_validator: SceneValidator | None = None
 def _worker_init(rrt_budget_s: float) -> None:
     """Initialise a SceneValidator in each worker process.
 
-    Called once by ProcessPoolExecutor before any tasks are dispatched to
-    the worker. Drake plant construction is expensive; amortise it here.
+    Called once per worker process before any tasks are dispatched.
+    Drake plant construction is expensive; amortise it here.
+
+    With multiprocessing.Pool(maxtasksperchild=N), workers are recycled
+    after N tasks. _worker_init fires again in each replacement worker,
+    so the validator is always initialised before use.
     """
     global _worker_validator
     _worker_validator = SceneValidator(
@@ -85,11 +89,16 @@ def _worker_init(rrt_budget_s: float) -> None:
 
 def _validate_task(
     args: tuple[CandidateScene, int],
-) -> ValidityReport:
-    """Validate a single candidate scene. Called in a worker process."""
+) -> tuple[CandidateScene, ValidityReport]:
+    """Validate a single candidate scene. Called in a worker process.
+
+    Returns (candidate, report) so the caller can match results to inputs
+    without relying on result order (imap_unordered does not preserve order).
+    """
     candidate, rrt_seed = args
     assert _worker_validator is not None, "Worker not initialised"
-    return _worker_validator.validate(candidate.scene, rrt_seed=rrt_seed)
+    report = _worker_validator.validate(candidate.scene, rrt_seed=rrt_seed)
+    return candidate, report
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +300,10 @@ def main() -> int:
     # Log run identity to stderr (always; W&B may also capture this).
     logger.info(
         "generate_dataset | git_sha=%s | config_hash=%s | seed=%d | "
-        "target_n=%s | rrt_budget_s=%s | num_workers=%s",
+        "target_n=%s | rrt_budget_s=%s | num_workers=%s | max_tasks_per_worker=%s",
         git_sha, config_hash, seed,
         cfg["target_n"], cfg["rrt_budget_s"], cfg["num_workers"],
+        cfg.get("max_tasks_per_worker", 200),
     )
 
     # W&B (optional).
@@ -321,6 +331,7 @@ def main() -> int:
     shard_size_mb: float = float(cfg["shard_size_mb"])
     rrt_budget_s: float = float(cfg["rrt_budget_s"])
     max_attempts: int = target_n * int(cfg["max_attempts_multiplier"])
+    max_tasks_per_worker: int = int(cfg.get("max_tasks_per_worker", 200))
 
     # Stats.
     template_attempts: Counter = Counter()
@@ -360,11 +371,12 @@ def main() -> int:
 
         total_attempts = 0
 
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=num_workers,
+        with multiprocessing.Pool(
+            processes=num_workers,
             initializer=_worker_init,
             initargs=(rrt_budget_s,),
-        ) as executor:
+            maxtasksperchild=max_tasks_per_worker,
+        ) as pool:
 
             while writer.accepted_count < target_n:
                 if total_attempts >= max_attempts:
@@ -386,15 +398,21 @@ def main() -> int:
                     int(rrt_rng.integers(0, 2**31)) for _ in batch
                 ]
 
-                # Dispatch validation tasks to the worker pool.
-                future_to_candidate = {
-                    executor.submit(_validate_task, (c, s)): c
-                    for c, s in zip(batch, rrt_seeds)
-                }
+                # Dispatch via imap_unordered: results arrive as they complete,
+                # preserving the same unordered processing as as_completed.
+                # chunksize=1 ensures maxtasksperchild counts individual tasks,
+                # not chunks (chunked imap would decrement the counter once per
+                # chunk regardless of chunk size).
+                args_iter = [(c, s) for c, s in zip(batch, rrt_seeds)]
 
-                for future, candidate in future_to_candidate.items():
+                for candidate, report_or_exc in pool.imap_unordered(
+                    _validate_task, args_iter, chunksize=1
+                ):
+                    # imap_unordered re-raises worker exceptions in the main
+                    # process; wrap in try/except to match the existing
+                    # future.result() exception handling.
                     try:
-                        report: ValidityReport = future.result()
+                        report: ValidityReport = report_or_exc
                     except Exception as exc:
                         logger.warning(
                             "Validation raised unexpected exception: %s", exc

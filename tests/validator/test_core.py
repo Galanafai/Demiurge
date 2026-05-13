@@ -186,16 +186,25 @@ class TestRRTPlantHardening:
 
 
 # ---------------------------------------------------------------------------
-# Cache consistency
+# Determinism (formerly Cache consistency)
 # ---------------------------------------------------------------------------
 
 
-class TestCache:
-    def test_same_scene_returns_same_report(self, validator: SceneValidator) -> None:
+class TestDeterminism:
+    def test_same_scene_same_result(self, validator: SceneValidator) -> None:
+        """Same scene and seed must produce identical validity outcomes.
+
+        The result cache was removed (0% hit rate in production; see
+        artifacts/leak_diagnosis.md). This test verifies determinism at
+        the semantic level rather than Python object identity.
+        """
         scene = make_valid_sparse()
         r1 = validator.validate(scene, rrt_seed=42)
         r2 = validator.validate(scene, rrt_seed=42)
-        assert r1 is r2, "Cache must return the identical report object on second call"
+        assert r1.accepted == r2.accepted
+        assert r1.no_interpenetration == r2.no_interpenetration
+        assert r1.stable_rest == r2.stable_rest
+        assert r1.ik_reachable == r2.ik_reachable
 
     def test_batch_single_worker_matches_sequential(
         self, validator: SceneValidator

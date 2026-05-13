@@ -44,6 +44,12 @@ shard_size_mb: 500      # Maximum size of each .tar shard
 num_workers: 7          # CCX33: 8 dedicated AMD cores minus 1 for OS and writer process.
                         # If upgraded to CCX43 (16 cores): increase to 15.
                         # Writer is single-threaded tar; exceeding (cores-1) causes thrash.
+max_tasks_per_worker: 200
+                        # Worker recycling to bound memory growth from pydrake C++ allocator
+                        # (~0.56 MB/call, confirmed by discriminating probes -- see
+                        # artifacts/leak_diagnosis.md). At 200 tasks/worker, peak RSS per
+                        # worker is ~112 MB; 7 workers = ~784 MB total, well within 32 GB.
+                        # Throughput cost: ~1.5% (4s respawn / 260s worker lifetime).
 batch_size: 64          # Candidates sampled and dispatched per round
 # Hard stop: if total attempts exceed target_n * max_attempts_multiplier, halt with error.
 max_attempts_multiplier: 10
