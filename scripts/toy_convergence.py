@@ -38,11 +38,13 @@ from validator.core import SceneValidator  # noqa: E402
 
 BUDGET_S: float = 30 * 60.0   # 30-minute hard gate
 VALIDITY_THRESHOLD: float = 0.9
-TOY_N_TRAIN: int = 2_000      # real scenes -- small enough to overfit
+TOY_N_TRAIN: int = 700        # tabletop_reach/1-obj -- all available in shard 0
 TOY_BATCH: int = 64
-TOY_MAX_STEPS: int = 10_000
+TOY_MAX_STEPS: int = 25_000   # ~28min at ~900 steps/min; leaves 2min for Drake
 TOY_DDIM_STEPS: int = 50
 TOY_VAL_N: int = 100
+TOY_TASK_FAMILY: str = "tabletop_reach"
+TOY_MAX_OBJECTS: int = 1      # 1-object scenes: simplest valid distribution
 
 
 # ---------------------------------------------------------------------------
@@ -54,11 +56,17 @@ def _load_toy_dataset(
     n: int,
     seed: int = 0,
     bounds: WorkspaceBounds | None = None,
+    task_family: str = "tabletop_reach",
+    max_objects: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Load n real validated scenes from data/v1 as the toy distribution.
 
+    Filters to scenes from ``task_family`` with at most ``max_objects``
+    present. This creates a homogeneous, low-diversity distribution that a
+    small model can overfit in a few thousand steps.
+
     Returns:
-        data:      (n, N_MAX, N_CONT=13) continuous feature tensor in normalised space
+        data:      (n, N_MAX, 13) continuous feature tensor in normalised space
         type_ids:  (n, N_MAX) long tensor
         presence:  (n, N_MAX) bool tensor
     """
@@ -72,14 +80,14 @@ def _load_toy_dataset(
     type_list: list[torch.Tensor] = []
     pres_list: list[torch.Tensor] = []
 
-    rng = torch.Generator()
-    rng.manual_seed(seed)
-
     reader = ShardReader("data/v1")
-    count = 0
-    for scene, _desc, _report, _sdf in reader:
-        if count >= n:
+    for scene, _desc, report, _sdf in reader:
+        if len(data_list) >= n:
             break
+        fam = report.get("task_family", "")
+        n_obj = int(scene.presence.sum().item())
+        if fam != task_family or n_obj > max_objects:
+            continue
         sn = scene.normalize(bounds)
         xyz = sn.poses[:, :3]                       # (N_MAX, 3) normalised
         rot6d = quat_wxyz_to_6d(sn.poses[:, 3:7])  # (N_MAX, 6)
@@ -89,12 +97,12 @@ def _load_toy_dataset(
         data_list.append(feat)
         type_list.append(sn.object_types)
         pres_list.append(sn.presence)
-        count += 1
 
-    if count < n:
+    if len(data_list) < n:
         raise RuntimeError(
-            f"Only {count} scenes available in data/v1, requested {n}. "
-            "Reduce --n-train or add more shards."
+            f"Only {len(data_list)} {task_family}/{max_objects}-obj scenes "
+            f"available in data/v1, requested {n}. "
+            "Reduce --n-train or relax the filter."
         )
 
     return (
@@ -199,10 +207,12 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     bounds = WorkspaceBounds.default()
 
-    # Load toy dataset from real validated scenes.
-    print(f"Loading {args.n_train} real scenes from data/v1...")
+    # Load toy dataset: tabletop_reach, 1-object scenes only.
+    print(f"Loading {args.n_train} real scenes from data/v1 "
+          f"({TOY_TASK_FAMILY}, max {TOY_MAX_OBJECTS} objects)...")
     dataset, type_ids_full, presence_full = _load_toy_dataset(
-        args.n_train, seed=args.seed, bounds=bounds
+        args.n_train, seed=args.seed, bounds=bounds,
+        task_family=TOY_TASK_FAMILY, max_objects=TOY_MAX_OBJECTS,
     )
     print(f"Dataset ready: {dataset.shape}.")
 
