@@ -261,7 +261,13 @@ class DDIMSampler:
             ab_prev_v = ab_prev.view(view).to(device)
 
             # Predicted x_0.
+            # Clamp x0_pred to prevent explosion when ab_t is near zero
+            # (e.g. t=T-1 where alpha_bar ~ 5e-8 on the cosine schedule).
+            # Normalised scene values live in roughly [-2, 2]; the ±10 range
+            # is generous but prevents catastrophic amplification while still
+            # allowing the model to express the full dynamic range.
             x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             # Direction pointing to x_t (eta=0 term is zero; kept for clarity).
             sigma = (
