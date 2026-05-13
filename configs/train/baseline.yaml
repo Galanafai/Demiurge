@@ -1,0 +1,77 @@
+# Training configuration for Demiurge DDPM -- default (d_model=256, ~8.9M params)
+#
+# Pass to train.py via --config:
+#   uv run python scripts/train.py --config configs/train/baseline.yaml --seed 42
+#
+# For the 5-epoch benchmark:
+#   uv run python scripts/train.py --config configs/train/baseline.yaml --seed 42 --max-epochs 5
+#
+# Override fields from CLI:
+#   ... --override training.batch_size=64 wandb.experiment=my_run
+
+# --- Model (default = d_model=256 config, ~8.9M params) ---
+# Promote to d_model=512 (~35M params) ONLY if unconditional validity rate < 0.4.
+# See configs/train/large.yaml for the 512 config.
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+
+# --- Diffusion schedule ---
+diffusion:
+  T: 1000         # Training diffusion steps
+  ddim_steps: 50  # DDIM inference steps at validation/sampling time
+
+# --- Training loop ---
+training:
+  batch_size: 128
+  lr: 3.0e-4
+  warmup_steps: 1000
+  max_steps: 100000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000         # Save checkpoint every N optimizer steps
+  val_every_epochs: 10           # Run Drake validity check every N epochs
+  val_n_scenes: 100              # Scenes to sample per validation pass
+  dtype: "float32"               # "float16" or "bfloat16" for mixed precision on GPU
+
+  # Per-template weighted sampling to compensate for cluttered_pick imbalance.
+  # Weights: inversely proportional to per-template scene count.
+  # tabletop_reach 20318 / obstacle_avoidance 15921 / cluttered_pick 8164.
+  # pre-tracking initial 5597 scenes have unknown template; treated as uniform.
+  weighted_sampling: true
+
+# --- Loss weights ---
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.5
+  type_ce: 0.1
+  presence_bce: 0.05
+
+# --- Dataset ---
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  # Template-stratified held-out split: last 100 scenes per template.
+  # tabletop_reach: indices [20218, 20318), obstacle_avoidance: [15821, 15921),
+  # cluttered_pick: [8064, 8164). Pre-tracking block treated as train-only.
+  held_out_per_template: 100
+  num_workers: 4
+
+# --- Output ---
+output:
+  dir: "checkpoints/unconditional_v1"
+
+# --- W&B ---
+# If wandb.enabled=true, WANDB_API_KEY must be set in the environment.
+# train.py raises EnvironmentError on startup if the key is missing.
+# Do NOT set WANDB_MODE=offline for production GPU runs.
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "unconditional_v1"
+  tags: ["model", "week3", "unconditional", "d256", "50k"]
