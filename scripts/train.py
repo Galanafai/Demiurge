@@ -272,9 +272,15 @@ def run_validation(
         remaining -= b
 
         # Decode x0 -> SceneTensor and validate.
-        xyz = x0[:, :, :3]
+        # Clamp xyz to normalised workspace bounds [-1, 1] before decode.
+        # DDIM accumulation can drift marginally outside this range even with
+        # the x0_pred clamp; applying it here prevents Drake from receiving
+        # physically impossible coordinates (e.g. y=-0.51m outside workspace).
+        xyz = x0[:, :, :3].clamp(-1.0, 1.0)
         rot6d_pred = x0[:, :, 3:9]
-        scale_pred = x0[:, :, 9:12]
+        # Normalised scale range: (physical - 1.0) / 0.5, so physical [0.5, 1.5]
+        # maps to normalised [-1.0, 1.0]. Clamp in normalised space.
+        scale_pred = x0[:, :, 9:12].clamp(-1.0, 1.0)
         pres_bit = x0[:, :, 12]
 
         for i in range(b):
@@ -285,7 +291,7 @@ def run_validation(
             st_norm = SceneTensor(
                 object_types=types,
                 poses=poses_raw,
-                scales=scale_pred[i].clamp(0.5, 2.0),
+                scales=scale_pred[i],
                 presence=pres_mask,
             )
             st = st_norm.denormalize(bounds)
