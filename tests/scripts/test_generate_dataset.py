@@ -212,3 +212,80 @@ class TestGenerationIntegration:
 def generate_description(candidate, rng):
     from data.descriptions import generate_description as _gd
     return _gd(candidate, rng)
+
+
+# ---------------------------------------------------------------------------
+# Pool drain regression test (Step 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(90)
+def test_pool_drains_correctly(tmp_path: pathlib.Path) -> None:
+    """generate_dataset.py must reach target_n=20 without hanging.
+
+    Runs via subprocess with:
+    - target_n=20
+    - num_workers=2
+    - max_tasks_per_worker=5   -> rotation_interval=10; forces 2+ rotations
+    - rrt_budget_s=0.5         -> fast RRT
+    - batch_size=8
+
+    Must complete in <90 seconds. Asserts manifest.accepted_count==20.
+
+    Catches deadlocks in the executor dispatch loop (previously triggered
+    by imap_unordered or apply_async with maxtasksperchild in CPython 3.11)
+    and regressions in the rotation logic.
+    """
+    import subprocess
+    import time
+
+    _REPO = pathlib.Path(__file__).resolve().parent.parent.parent
+    _SCRIPT = _REPO / "scripts" / "generate_dataset.py"
+    _BASE_CONFIG = _REPO / "configs" / "dataset" / "v1.yaml"
+
+    output_dir = tmp_path / "data"
+    output_dir.mkdir()
+
+    cmd = [
+        sys.executable, str(_SCRIPT),
+        "--config", str(_BASE_CONFIG),
+        "--seed", "42",
+        "--override",
+        f"output_dir={output_dir}",
+        "target_n=20",
+        "num_workers=2",
+        "max_tasks_per_worker=5",
+        "rrt_budget_s=0.5",
+        "batch_size=8",
+        "shard_size_mb=100",
+        "max_attempts_multiplier=50",
+    ]
+
+    t0 = time.monotonic()
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        cwd=str(_REPO),
+    )
+    elapsed = time.monotonic() - t0
+
+    assert result.returncode == 0, (
+        f"generate_dataset.py exited with code {result.returncode}.\n"
+        f"--- stdout ---\n{result.stdout[-3000:]}\n"
+        f"--- stderr ---\n{result.stderr[-3000:]}"
+    )
+
+    manifest_path = output_dir / "manifest.json"
+    assert manifest_path.exists(), (
+        f"manifest.json not found in {output_dir}."
+    )
+
+    manifest = json.loads(manifest_path.read_text())
+    accepted = manifest["accepted_count"]
+
+    assert accepted == 20, (
+        f"Expected accepted_count=20, got {accepted}. "
+        f"Elapsed: {elapsed:.1f}s."
+    )

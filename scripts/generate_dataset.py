@@ -28,11 +28,11 @@ Decision gate (per-template acceptance rate):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import logging
 import math
-import multiprocessing
 import subprocess
 import sys
 import time
@@ -93,7 +93,8 @@ def _validate_task(
     """Validate a single candidate scene. Called in a worker process.
 
     Returns (candidate, report) so the caller can match results to inputs
-    without relying on result order (imap_unordered does not preserve order).
+    when using pool.apply_async (results arrive in completion order, not
+    submission order).
     """
     candidate, rrt_seed = args
     assert _worker_validator is not None, "Worker not initialised"
@@ -371,82 +372,119 @@ def main() -> int:
 
         total_attempts = 0
 
-        with multiprocessing.Pool(
-            processes=num_workers,
-            initializer=_worker_init,
-            initargs=(rrt_budget_s,),
-            maxtasksperchild=max_tasks_per_worker,
-        ) as pool:
+        # Executor rotation for bounded memory.
+        #
+        # Root cause: pydrake's Diagram/Context C++ backing memory is not
+        # released synchronously when Python wrappers drop. Workers accumulate
+        # ~0.56 MB per validate() call. Memory is only reclaimed when the worker
+        # process exits.
+        #
+        # Fix: shut down and recreate the executor every rotation_interval total
+        # task attempts. ProcessPoolExecutor.shutdown(wait=True) drains all
+        # in-flight futures before returning, so no results are lost.
+        #
+        # Why not multiprocessing.Pool(maxtasksperchild): CPython 3.11 has a bug
+        # where the pool result-handler thread dies on worker exit, causing both
+        # imap_unordered and apply_async to hang silently (AssertionError:
+        # 'Cannot have cache with result_handler not alive'). Reproduced locally
+        # at maxtasksperchild=10, num_workers=3.
+        #
+        # Memory bound: rotation_interval * 0.56 MB
+        #   = (max_tasks_per_worker * num_workers) * 0.56 MB
+        #   = (200 * 7) * 0.56 MB = ~784 MB -- same design target as before.
+        # Rotation cost: shutdown(wait=True) blocks for at most
+        #   num_workers * avg_task_s = 7 * 1.3s = ~9s worst case per rotation.
+        rotation_interval: int = max_tasks_per_worker * num_workers
 
-            while writer.accepted_count < target_n:
-                if total_attempts >= max_attempts:
-                    logger.error(
-                        "Hard stop: total_attempts=%d >= max_attempts=%d. "
-                        "Check per-template acceptance rates.",
-                        total_attempts, max_attempts,
+        def _make_executor() -> concurrent.futures.ProcessPoolExecutor:
+            return concurrent.futures.ProcessPoolExecutor(
+                max_workers=num_workers,
+                initializer=_worker_init,
+                initargs=(rrt_budget_s,),
+            )
+
+        executor = _make_executor()
+        tasks_since_rotation: int = 0
+
+        while writer.accepted_count < target_n:
+            if total_attempts >= max_attempts:
+                logger.error(
+                    "Hard stop: total_attempts=%d >= max_attempts=%d. "
+                    "Check per-template acceptance rates.",
+                    total_attempts, max_attempts,
+                )
+                pbar.close()
+                _print_stats_table(
+                    template_attempts, template_accepted,
+                    time.monotonic() - start_time,
+                )
+                executor.shutdown(wait=False, cancel_futures=True)
+                return 1
+
+            # Rotate executor to reclaim pydrake C++ allocator memory.
+            if tasks_since_rotation >= rotation_interval:
+                logger.info(
+                    "Rotating executor after %d tasks (memory reclaim). "
+                    "Draining in-flight futures...",
+                    tasks_since_rotation,
+                )
+                executor.shutdown(wait=True)
+                executor = _make_executor()
+                tasks_since_rotation = 0
+
+            # Sample a batch of candidates.
+            batch: list[CandidateScene] = sampler.sample_batch(batch_size)
+            rrt_seeds = [
+                int(rrt_rng.integers(0, 2**31)) for _ in batch
+            ]
+
+            # Submit and collect results.
+            future_to_candidate = {
+                executor.submit(_validate_task, (c, s)): c
+                for c, s in zip(batch, rrt_seeds)
+            }
+
+            for future in concurrent.futures.as_completed(future_to_candidate):
+                candidate = future_to_candidate[future]
+                tasks_since_rotation += 1
+                try:
+                    _result_candidate, report = future.result()
+                except Exception as exc:
+                    logger.warning(
+                        "Validation raised unexpected exception: %s", exc
                     )
-                    pbar.close()
-                    _print_stats_table(
-                        template_attempts, template_accepted,
-                        time.monotonic() - start_time,
-                    )
-                    return 1
-
-                # Sample a batch of candidates.
-                batch: list[CandidateScene] = sampler.sample_batch(batch_size)
-                rrt_seeds = [
-                    int(rrt_rng.integers(0, 2**31)) for _ in batch
-                ]
-
-                # Dispatch via imap_unordered: results arrive as they complete,
-                # preserving the same unordered processing as as_completed.
-                # chunksize=1 ensures maxtasksperchild counts individual tasks,
-                # not chunks (chunked imap would decrement the counter once per
-                # chunk regardless of chunk size).
-                args_iter = [(c, s) for c, s in zip(batch, rrt_seeds)]
-
-                for candidate, report_or_exc in pool.imap_unordered(
-                    _validate_task, args_iter, chunksize=1
-                ):
-                    # imap_unordered re-raises worker exceptions in the main
-                    # process; wrap in try/except to match the existing
-                    # future.result() exception handling.
-                    try:
-                        report: ValidityReport = report_or_exc
-                    except Exception as exc:
-                        logger.warning(
-                            "Validation raised unexpected exception: %s", exc
-                        )
-                        template_attempts[candidate.task_family] += 1
-                        total_attempts += 1
-                        continue
-
                     template_attempts[candidate.task_family] += 1
                     total_attempts += 1
+                    continue
 
-                    if report.accepted:
-                        desc = generate_description(candidate, desc_rng)
-                        report_dict = _report_to_dict(report)
-                        report_dict["task_family"] = candidate.task_family
-                        writer.write(candidate.scene, desc, report_dict)
-                        template_accepted[candidate.task_family] += 1
-                        pbar.update(1)
+                template_attempts[candidate.task_family] += 1
+                total_attempts += 1
 
-                        # Periodic stats table.
-                        n_acc = writer.accepted_count
-                        if n_acc % checkpoint_interval == 0:
-                            elapsed = time.monotonic() - start_time
-                            _print_stats_table(
-                                template_attempts, template_accepted, elapsed
+                if report.accepted:
+                    desc = generate_description(candidate, desc_rng)
+                    report_dict = _report_to_dict(report)
+                    report_dict["task_family"] = candidate.task_family
+                    writer.write(candidate.scene, desc, report_dict)
+                    template_accepted[candidate.task_family] += 1
+                    pbar.update(1)
+
+                    # Periodic stats table.
+                    n_acc = writer.accepted_count
+                    if n_acc % checkpoint_interval == 0:
+                        elapsed = time.monotonic() - start_time
+                        _print_stats_table(
+                            template_attempts, template_accepted, elapsed
+                        )
+                        if wandb_run is not None:
+                            _log_wandb(
+                                wandb_run, n_acc, template_attempts,
+                                template_accepted, elapsed,
                             )
-                            if wandb_run is not None:
-                                _log_wandb(
-                                    wandb_run, n_acc, template_attempts,
-                                    template_accepted, elapsed,
-                                )
 
-                        if writer.accepted_count >= target_n:
-                            break  # inner for-loop; outer while checks condition
+                    if writer.accepted_count >= target_n:
+                        break  # inner for-loop; outer while checks condition
+
+        executor.shutdown(wait=True)
 
         pbar.close()
 

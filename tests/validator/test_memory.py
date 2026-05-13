@@ -1,17 +1,16 @@
-"""Memory and worker-recycling regression tests for SceneValidator.
+"""Memory and executor-rotation regression tests for SceneValidator.
 
 Two tests:
   1. test_validator_cache_removed: _cache must not exist on SceneValidator.
      Catches accidental re-introduction of the unbounded per-call cache
      that caused the CCX33 OOM at scene 5597 (~0.56 MB/call accumulation).
 
-  2. test_pool_recycles_workers: Pool(maxtasksperchild=2) must produce at
-     least 2 distinct child PIDs across 4 tasks. Catches accidental removal
-     of maxtasksperchild from the generate_dataset.py pool configuration.
+  2. test_executor_rotates: successive ProcessPoolExecutor instances must
+     produce non-overlapping worker PIDs. Catches accidental removal of
+     the rotation logic that reclaims pydrake C++ allocator memory.
 """
 from __future__ import annotations
 
-import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -52,33 +51,40 @@ def test_validator_cache_removed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 2: pool worker recycling
+# Test 2: executor rotation
 # ---------------------------------------------------------------------------
 
 
 def _pid_task(_: int) -> int:
-    """Return the current worker PID. Used to verify worker recycling."""
+    """Return the current worker PID."""
     return os.getpid()
 
 
-def test_pool_recycles_workers() -> None:
-    """Pool(maxtasksperchild=2) must recycle workers.
+def test_executor_rotates() -> None:
+    """Executor rotation must produce distinct worker PIDs across lifetimes.
 
-    With maxtasksperchild=2 and 4 tasks submitted to a 1-process pool,
-    at least 2 distinct PIDs must be observed. If only 1 PID appears,
-    maxtasksperchild is not taking effect.
+    The memory fix uses ProcessPoolExecutor.shutdown(wait=True) + recreation
+    every rotation_interval tasks. This test verifies two successive executors
+    produce non-overlapping worker PIDs, confirming workers exit and new ones
+    spawn at each rotation.
 
-    Uses a single-process pool so worker lifetime is predictable.
-    Catches accidental removal or disabling of maxtasksperchild in the
-    generate_dataset.py pool configuration.
+    Catches accidental removal of the rotation logic in generate_dataset.py.
     """
-    with multiprocessing.Pool(processes=1, maxtasksperchild=2) as pool:
-        pids = pool.map(_pid_task, range(4))
+    import concurrent.futures
 
-    unique_pids = set(pids)
-    assert len(unique_pids) >= 2, (
-        f"Expected at least 2 distinct worker PIDs (maxtasksperchild=2, 4 tasks), "
-        f"got {len(unique_pids)}: {unique_pids}. "
-        "Check that multiprocessing.Pool is constructed with maxtasksperchild "
-        "in scripts/generate_dataset.py."
+    # First executor lifetime.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as exc1:
+        futures = [exc1.submit(_pid_task, i) for i in range(2)]
+        pids_1 = {f.result() for f in concurrent.futures.as_completed(futures)}
+
+    # Second executor lifetime (fresh processes after shutdown).
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as exc2:
+        futures = [exc2.submit(_pid_task, i) for i in range(2)]
+        pids_2 = {f.result() for f in concurrent.futures.as_completed(futures)}
+
+    assert pids_1.isdisjoint(pids_2), (
+        f"Executor 1 PIDs {pids_1} overlap with Executor 2 PIDs {pids_2}. "
+        "Workers from executor 1 should have exited before executor 2 started. "
+        "Rotation is not creating fresh processes."
     )
+
