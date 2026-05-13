@@ -1,11 +1,11 @@
 """Object vocabulary for the Demiurge scene schema.
 
-Defines OBJECT_VOCAB: a fixed 8-entry registry mapping integer type IDs to ObjectEntry
+Defines OBJECT_VOCAB: a fixed 16-entry registry mapping integer type IDs to ObjectEntry
 instances. All SDFs are inline geometry strings. The PyPI drake wheel does not ship YCB
-mesh assets, so YCB-keyed entries (IDs 5-7) use primitive approximations with dimensions
+mesh assets, so YCB-keyed entries (IDs 5-15) use primitive approximations with dimensions
 matched to the real YCB objects. This is sufficient for Drake collision and IK checks.
 
-Do not add entries beyond ID 7 without explicit approval (AGENTS.md: fixed vocabulary).
+Do not add entries beyond ID 15 without explicit approval (AGENTS.md: fixed vocabulary).
 """
 
 from __future__ import annotations
@@ -22,9 +22,18 @@ class ObjectTypeId(IntEnum):
     CYLINDER = 2
     BOX_TALL = 3
     BOX_FLAT = 4
-    MUSTARD_BOTTLE = 5  # YCB 006: approximated as cylinder r=0.03 h=0.19
-    SUGAR_BOX = 6  # YCB 004: approximated as box 0.038 x 0.086 x 0.175
+    MUSTARD_BOTTLE = 5   # YCB 006: approximated as cylinder r=0.03 h=0.19
+    SUGAR_BOX = 6        # YCB 004: approximated as box 0.038 x 0.086 x 0.175
     TOMATO_SOUP_CAN = 7  # YCB 005: approximated as cylinder r=0.033 h=0.102
+    # Week 2.5 expansion: 8 new YCB-keyed entries (inline primitives; mesh SDFs not
+    # shipped in the PyPI drake wheel).
+    BLEACH_CLEANSER = 8   # YCB 021: cylinder r=0.040 h=0.250; upright_constrained
+    BANANA = 9            # YCB 011: box 0.090 x 0.040 x 0.180 (oriented lengthwise)
+    MASTER_CHEF_CAN = 10  # YCB 002: cylinder r=0.052 h=0.142
+    GELATIN_BOX = 11      # YCB 009: box 0.056 x 0.112 x 0.166
+    # IDs 12-15 (PUDDING_BOX, CRACKER_BOX, POTTED_MEAT_CAN, POWER_DRILL) were
+    # removed in Week 2.5 profiling. Their large bounding volumes collapsed RRT
+    # solvability in cluttered_pick to <2%. See validator_profile.md.
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,13 @@ class ObjectEntry:
             {model_name}, {mass}, {radius} for sphere.
         sdf_kind: One of "box", "sphere", "cylinder". Controls which template
             placeholders are active.
+        upright_constrained: If True, this entry must be sampled with a
+            yaw-only rotation (no roll, no pitch). Set for entries where
+            canonical_half_extents_m[2] > 0.10 m -- i.e., total height > 0.20 m.
+            Currently only BLEACH_CLEANSER (hz=0.125 m) qualifies.
+            The sampler already produces yaw-only orientations for all entries;
+            this flag is documentation and enforcement against future samplers
+            that introduce SO(3) augmentation for unconstrained entries.
     """
 
     name: str
@@ -51,6 +67,7 @@ class ObjectEntry:
     canonical_half_extents_m: tuple[float, float, float]
     sdf_template: str
     sdf_kind: str
+    upright_constrained: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +210,43 @@ OBJECT_VOCAB: dict[int, ObjectEntry] = {
         sdf_template=_CYLINDER_SDF,
         sdf_kind="cylinder",
     ),
+    # -------------------------------------------------------------------------
+    # Week 2.5 additions: YCB-keyed inline primitives.
+    # Dimensions sourced from YCB dataset bounding-box measurements.
+    # Bounding radius = sqrt(hx^2+hy^2+hz^2) for box, sqrt(r^2+(h/2)^2) for cylinder.
+    # -------------------------------------------------------------------------
+    ObjectTypeId.BLEACH_CLEANSER: ObjectEntry(
+        name="bleach_cleanser",
+        bounding_radius_m=0.132,  # sqrt(0.040^2 + 0.125^2)
+        canonical_half_extents_m=(0.040, 0.040, 0.125),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+        upright_constrained=True,  # hz=0.125m > 0.10m threshold
+    ),
+    ObjectTypeId.BANANA: ObjectEntry(
+        name="banana",
+        bounding_radius_m=0.103,  # sqrt(0.045^2 + 0.020^2 + 0.090^2) = 0.1026
+        canonical_half_extents_m=(0.045, 0.020, 0.090),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
+    ObjectTypeId.MASTER_CHEF_CAN: ObjectEntry(
+        name="master_chef_can",
+        bounding_radius_m=0.088,  # sqrt(0.052^2 + 0.071^2)
+        canonical_half_extents_m=(0.052, 0.052, 0.071),
+        sdf_template=_CYLINDER_SDF,
+        sdf_kind="cylinder",
+    ),
+    ObjectTypeId.GELATIN_BOX: ObjectEntry(
+        name="gelatin_box",
+        bounding_radius_m=0.104,  # sqrt(0.028^2 + 0.056^2 + 0.083^2)
+        canonical_half_extents_m=(0.028, 0.056, 0.083),
+        sdf_template=_BOX_SDF,
+        sdf_kind="box",
+    ),
 }
 
-assert len(OBJECT_VOCAB) == 8, "Vocabulary must have exactly 8 entries."
+assert len(OBJECT_VOCAB) == 12, "Vocabulary must have exactly 12 entries."
 
 
 def build_sdf(entry: ObjectEntry, model_name: str, scale: float = 1.0, mass: float = 0.5) -> str:

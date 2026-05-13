@@ -6,8 +6,8 @@ from scene.vocab import OBJECT_VOCAB, ObjectTypeId, build_sdf
 
 
 class TestVocabLength:
-    def test_vocab_has_eight_entries(self) -> None:
-        assert len(OBJECT_VOCAB) == 8
+    def test_vocab_has_twelve_entries(self) -> None:
+        assert len(OBJECT_VOCAB) == 12
 
     def test_all_type_ids_present(self) -> None:
         for tid in ObjectTypeId:
@@ -77,3 +77,110 @@ class TestSdfKind:
         assert OBJECT_VOCAB[ObjectTypeId.CYLINDER].sdf_kind == "cylinder"
         assert OBJECT_VOCAB[ObjectTypeId.BOX_TALL].sdf_kind == "box"
         assert OBJECT_VOCAB[ObjectTypeId.BOX_FLAT].sdf_kind == "box"
+
+
+# ---------------------------------------------------------------------------
+# Week 2.5 additions: new YCB entry validation
+# ---------------------------------------------------------------------------
+
+_NEW_ENTRY_IDS = [
+    ObjectTypeId.BLEACH_CLEANSER,
+    ObjectTypeId.BANANA,
+    ObjectTypeId.MASTER_CHEF_CAN,
+    ObjectTypeId.GELATIN_BOX,
+]
+
+
+class TestNewYcbEntries:
+    """Per-entry validation for the 8 new Week 2.5 vocab additions."""
+
+    @pytest.mark.parametrize("type_id", _NEW_ENTRY_IDS)
+    def test_bounding_radius_covers_max_half_extent(self, type_id: ObjectTypeId) -> None:
+        """bounding_radius_m must be >= the maximum half-extent of the geometry.
+
+        For a cylinder entry, the effective bounding radius is sqrt(r^2 + (h/2)^2).
+        For a box entry, it is the half-diagonal sqrt(hx^2 + hy^2 + hz^2).
+        This test verifies the stored bounding_radius_m is at least as large as
+        the maximum single half-extent (a weaker but fast algebraic check).
+        """
+        entry = OBJECT_VOCAB[int(type_id)]
+        max_half = max(entry.canonical_half_extents_m)
+        assert entry.bounding_radius_m >= max_half, (
+            f"{entry.name}: bounding_radius_m={entry.bounding_radius_m:.4f} < "
+            f"max_half_extent={max_half:.4f}"
+        )
+
+    @pytest.mark.parametrize("type_id", _NEW_ENTRY_IDS)
+    def test_bounding_radius_equals_geometric_formula(self, type_id: ObjectTypeId) -> None:
+        """bounding_radius_m must match the expected geometric formula within 1mm."""
+        import math
+        entry = OBJECT_VOCAB[int(type_id)]
+        hx, hy, hz = entry.canonical_half_extents_m
+        if entry.sdf_kind == "box":
+            expected = math.sqrt(hx**2 + hy**2 + hz**2)
+        elif entry.sdf_kind == "cylinder":
+            # hx == hy == r; hz == h/2
+            r, half_h = hx, hz
+            expected = math.sqrt(r**2 + half_h**2)
+        else:
+            expected = math.sqrt(hx**2 + hy**2 + hz**2)
+        assert abs(entry.bounding_radius_m - expected) < 0.001, (
+            f"{entry.name}: bounding_radius_m={entry.bounding_radius_m:.4f}, "
+            f"geometric formula={expected:.4f} (diff > 1mm)"
+        )
+
+    @pytest.mark.parametrize("type_id", _NEW_ENTRY_IDS)
+    def test_sdf_kind_is_box_or_cylinder(self, type_id: ObjectTypeId) -> None:
+        """New YCB entries use only box or cylinder primitives (no sphere)."""
+        entry = OBJECT_VOCAB[int(type_id)]
+        assert entry.sdf_kind in {"box", "cylinder"}, (
+            f"{entry.name}: unexpected sdf_kind={entry.sdf_kind!r}"
+        )
+
+    @pytest.mark.parametrize("type_id", _NEW_ENTRY_IDS)
+    def test_name_matches_enum_member(self, type_id: ObjectTypeId) -> None:
+        """Entry name must match the enum member name (lowercase, underscores)."""
+        entry = OBJECT_VOCAB[int(type_id)]
+        expected_name = type_id.name.lower()
+        assert entry.name == expected_name, (
+            f"Entry name {entry.name!r} != enum name {expected_name!r} for id={type_id}"
+        )
+
+    def test_upright_constrained_flag_matches_hz_threshold(self) -> None:
+        """Every entry with hz > 0.10m must have upright_constrained=True.
+
+        hz threshold = canonical_half_extents_m[2] > 0.10.
+        Currently only BLEACH_CLEANSER qualifies (hz=0.125m).
+        This test enforces the invariant so future contributors adding
+        tall objects cannot forget to set the flag.
+        """
+        for tid, entry in OBJECT_VOCAB.items():
+            hz = entry.canonical_half_extents_m[2]
+            if hz > 0.10:
+                assert entry.upright_constrained, (
+                    f"{entry.name} (id={tid}) has hz={hz:.3f}m > 0.10m "
+                    f"but upright_constrained=False"
+                )
+            else:
+                assert not entry.upright_constrained, (
+                    f"{entry.name} (id={tid}) has hz={hz:.3f}m <= 0.10m "
+                    f"but upright_constrained=True (check threshold)"
+                )
+
+
+class TestColorMapCoverage:
+    """Verify _TYPE_COLOR covers all 12 vocab entries with distinct values."""
+
+    def test_color_map_covers_all_type_ids(self) -> None:
+        from data.descriptions import _TYPE_COLOR
+        for tid in ObjectTypeId:
+            assert int(tid) in _TYPE_COLOR, (
+                f"ObjectTypeId {tid!r} (id={int(tid)}) missing from _TYPE_COLOR"
+            )
+
+    def test_all_colors_distinct(self) -> None:
+        from data.descriptions import _TYPE_COLOR
+        colors = list(_TYPE_COLOR.values())
+        assert len(colors) == len(set(colors)), (
+            f"Duplicate colors in _TYPE_COLOR: {[c for c in colors if colors.count(c) > 1]}"
+        )

@@ -1,0 +1,62 @@
+# Production dataset configuration for Demiurge v1.
+#
+# Pass to generate_dataset.py via --config:
+#   uv run python scripts/generate_dataset.py --config configs/dataset/v1.yaml --seed 42
+#
+# Override individual fields from the CLI:
+#   ... --override output_dir=data/v1_test target_n=1000
+
+# --- Decision record ---
+# 8-vocab profile (seed=0, 500 attempts): 13.2% overall acceptance.
+# 12-vocab re-profile (12-vocab, seed=0, 500 attempts): 9.8% overall acceptance.
+#   stable_rest recovered to 97.2% after dropping 4 large-volume entries.
+#   2s CCX43 projection: 8.1h; 2s CCX33 projection: ~15h -- within 20h gate.
+#
+# Cloud provider: Hetzner CCX33 (8 dedicated AMD cores, 32 GB RAM, ~$0.10/hr).
+# CCX43 was unavailable across all Hetzner DCs (initial plan).
+# RunPod EU-RO-1 16-vCPU pod returned "not enough free vcpu" after 1h wait.
+# CCX33 is available; use as primary. CCX43 is the upgrade path if it opens.
+# Worker count: 7 (8 cores minus 1 reserved for OS and writer process).
+# Writer bottleneck: single-threaded tar-write stream; past (cores-1) workers,
+# throughput degrades due to context-switching and cache thrashing.
+#
+# Vocab: 12-object set (IDs 0-11). IDs 12-15 dropped; see validator_profile.md.
+# See artifacts/validator_profile.md for full profiling record.
+
+# --- Target ---
+target_n: 50000
+output_dir: "data/v1"
+
+# --- Template mix (must sum to 1.0) ---
+mix:
+  tabletop_reach: 0.40
+  cluttered_pick: 0.30
+  obstacle_avoidance: 0.30
+
+# --- Validator ---
+rrt_budget_s: 2.0       # BiRRT wall-clock budget per scene (seconds)
+                        # 2s vs 5s: 0.8pp acceptance penalty, 1.8x throughput gain
+
+# --- Writer ---
+shard_size_mb: 500      # Maximum size of each .tar shard
+
+# --- Generation ---
+num_workers: 7          # CCX33: 8 dedicated AMD cores minus 1 for OS and writer process.
+                        # If upgraded to CCX43 (16 cores): increase to 15.
+                        # Writer is single-threaded tar; exceeding (cores-1) causes thrash.
+max_tasks_per_worker: 200
+                        # Worker recycling to bound memory growth from pydrake C++ allocator
+                        # (~0.56 MB/call, confirmed by discriminating probes -- see
+                        # artifacts/leak_diagnosis.md). At 200 tasks/worker, peak RSS per
+                        # worker is ~112 MB; 7 workers = ~784 MB total, well within 32 GB.
+                        # Throughput cost: ~1.5% (4s respawn / 260s worker lifetime).
+batch_size: 64          # Candidates sampled and dispatched per round
+# Hard stop: if total attempts exceed target_n * max_attempts_multiplier, halt with error.
+max_attempts_multiplier: 10
+
+# --- W&B ---
+wandb:
+  enabled: false        # Set to true for production; requires WANDB_API_KEY
+  project: "demiurge"
+  entity: null          # null = use default entity from wandb login
+  tags: ["data", "v1", "50k", "2s_budget", "12vocab", "ccx33"]

@@ -1,0 +1,30 @@
+# Profiling configuration for RRT budget smoke run (Task 5).
+#
+# Used by scripts/profile_rrt_budget.py to measure per-template acceptance rates
+# at 5s vs 2s RRT budget across 500 scenes before committing to 50k generation.
+#
+# Run directly:
+#   uv run python scripts/profile_rrt_budget.py --config configs/dataset/profile_500.yaml --seed 0
+
+target_n: 500
+output_dir: "data/profile_500"
+
+mix:
+  tabletop_reach: 0.40
+  cluttered_pick: 0.30
+  obstacle_avoidance: 0.30
+
+# rrt_budget_s is overridden by the profiling script for each budget arm.
+rrt_budget_s: 5.0
+
+shard_size_mb: 100
+
+num_workers: 4
+batch_size: 32
+max_attempts_multiplier: 10
+
+wandb:
+  enabled: false
+  project: "demiurge"
+  entity: null
+  tags: ["profile", "rrt_budget"]
