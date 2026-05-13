@@ -15,7 +15,7 @@ All per-component losses are returned individually for W&B logging.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -60,7 +60,14 @@ class LossOutput:
 
     def as_log_dict(self) -> dict[str, float]:
         """Return all components (including total) as float values."""
-        return {k: float(v.item()) for k, v in asdict(self).items()}
+        return {
+            "total": float(self.total.detach().item()),
+            "pose_xyz": float(self.pose_xyz.detach().item()),
+            "pose_rot": float(self.pose_rot.detach().item()),
+            "scale": float(self.scale.detach().item()),
+            "type_ce": float(self.type_ce.detach().item()),
+            "presence_bce": float(self.presence_bce.detach().item()),
+        }
 
 
 # ---------------------------------------------------------------------------

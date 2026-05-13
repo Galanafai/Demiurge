@@ -247,12 +247,29 @@ class SceneDenoiser(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Zero-initialise output heads so the model starts near identity."""
-        for head in (self.head_rot6d, self.head_xyz, self.head_scale, self.head_presence):
-            nn.init.zeros_(head.weight)
+        """Initialise output head weights.
+
+        Continuous noise heads (rot6d, xyz, scale): leave weights at PyTorch
+        default (Kaiming uniform). Zero-initialising them blocks gradient signal
+        at step 0 because the head output is identically zero regardless of the
+        transformer representation -- the model cannot learn which direction to
+        update. Biases are zeroed so the mean prediction starts at zero.
+
+        Presence head: bias initialised to -2.0 (sigmoid(-2) = 0.12) so the
+        model starts predicting "absent" for all slots. Zero bias (sigmoid(0)=0.5)
+        caused the model to drift toward predicting all 12 slots present, which
+        Drake rejects due to workspace collision.
+
+        AdaLN linear layers: zero-init so scale=0 and shift=0 at start,
+        equivalent to standard LayerNorm on the first forward pass.
+        """
+        # Continuous noise heads: zero biases only.
+        for head in (self.head_rot6d, self.head_xyz, self.head_scale):
             nn.init.zeros_(head.bias)
-        # AdaLN linear layers: zero-init so scale=0 and shift=0 at start
-        # (equivalent to standard LayerNorm on the first forward pass).
+        # Presence head: negative bias so model starts predicting absent.
+        nn.init.zeros_(self.head_presence.weight)
+        nn.init.constant_(self.head_presence.bias, -2.0)
+        # AdaLN: zero-init so conditioning starts as identity LayerNorm.
         for block in self.blocks:
             if isinstance(block, _DenoiserBlock):
                 nn.init.zeros_(block.adaln.weight)
