@@ -85,7 +85,7 @@ class CosineSchedule:
         Returns:
             alpha_bar_t: Float tensor of shape (B,).
         """
-        return self._alpha_bar[t.long()]
+        return self._alpha_bar[t.long().cpu()]
 
     def alpha_bar_prev(self, t: Tensor) -> Tensor:
         """alpha_bar at timestep t-1 (equals 1.0 when t=0).
@@ -96,15 +96,15 @@ class CosineSchedule:
         Returns:
             Float tensor of shape (B,).
         """
-        return self._alpha_bar_prev[t.long()]
+        return self._alpha_bar_prev[t.long().cpu()]
 
     def sqrt_alpha_bar(self, t: Tensor) -> Tensor:
         """sqrt(alpha_bar_t). Shape: (B,)."""
-        return self._sqrt_alpha_bar[t.long()]
+        return self._sqrt_alpha_bar[t.long().cpu()]
 
     def sqrt_one_minus_alpha_bar(self, t: Tensor) -> Tensor:
         """sqrt(1 - alpha_bar_t). Shape: (B,)."""
-        return self._sqrt_one_minus_alpha_bar[t.long()]
+        return self._sqrt_one_minus_alpha_bar[t.long().cpu()]
 
     # ------------------------------------------------------------------
     # Forward process
