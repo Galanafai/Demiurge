@@ -251,6 +251,11 @@ def _collate(
         presence_list.append(scene.presence)
         if text_cache is not None:
             key = hashlib.sha256(desc.encode()).hexdigest()
+            if key not in text_cache:
+                raise KeyError(
+                    f"Description hash {key[:12]}... not found in text_embeddings.pt. "
+                    "Re-run scripts/precompute_text_embeddings.py or check canonicalization."
+                )
             text_embs.append(text_cache[key])
     out: dict[str, torch.Tensor] = {
         "x_cont": torch.stack(x_conts),           # (B, N_MAX, 13)
@@ -422,12 +427,21 @@ def main() -> None:
             )
         print(f"Dataset hash verified: {actual_hash[:16]}...")
 
-    # Load text embedding cache if present.
+    # Load text embedding cache.
+    # text_conditioning=true in config means this is REQUIRED -- raise if missing.
+    text_conditioning = bool(cfg.get("text_conditioning", False))
     text_cache: dict[str, torch.Tensor] | None = None
     cache_path = Path(data_dir) / "text_embeddings.pt"
     if cache_path.exists():
-        text_cache = torch.load(cache_path, weights_only=True)
+        raw_cache = torch.load(cache_path, weights_only=True)
+        # Ensure all embeddings are float32 on CPU for collation.
+        text_cache = {k: v.float().cpu() for k, v in raw_cache.items()}
         print(f"Text embedding cache loaded: {len(text_cache)} entries")
+    elif text_conditioning:
+        raise FileNotFoundError(
+            f"text_conditioning=true but no text_embeddings.pt found at {cache_path}. "
+            "Run scripts/precompute_text_embeddings.py first."
+        )
     else:
         print("No text embedding cache found -- running unconditional.")
 
@@ -475,15 +489,37 @@ def main() -> None:
             return self._examples[self._indices[idx]]
 
     train_ds = _IndexDataset(all_examples, train_indices)
+    num_workers = int(dscfg.get("num_workers", 0))
+    pin_memory = bool(dscfg.get("pin_memory", device.type == "cuda"))
+    persistent_workers = bool(dscfg.get("persistent_workers", False)) and num_workers > 0
+    prefetch_factor: int | None = int(dscfg.get("prefetch_factor", 2)) if num_workers > 0 else None
+
+    _base_seed = args.seed
+
+    def _worker_init(worker_id: int) -> None:  # pragma: no cover
+        """Seed each DataLoader worker deterministically from the global seed."""
+        import random
+
+        import numpy as np
+        worker_seed = _base_seed + worker_id
+        torch.manual_seed(worker_seed)
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size,
         sampler=sampler,
         shuffle=(sampler is None),
         collate_fn=lambda b: _collate(b, bounds, text_cache),
-        num_workers=int(dscfg.get("num_workers", 0)),
-        pin_memory=(device.type == "cuda"),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        worker_init_fn=_worker_init if num_workers > 0 else None,
         drop_last=True,
     )
+    print(f"DataLoader: num_workers={num_workers} pin_memory={pin_memory} "
+          f"persistent_workers={persistent_workers} prefetch_factor={prefetch_factor}")
 
     # --- Optimizer + LR schedule ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)

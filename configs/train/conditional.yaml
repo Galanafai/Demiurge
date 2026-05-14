@@ -1,0 +1,77 @@
+# Training configuration for Demiurge conditional DDPM -- conditional_v1
+#
+# Text-conditioned variant of the baseline (d_model=256, ~8.9M params).
+# Uses v3 Pareto-optimal loss weights (presence_bce=1.0).
+# Trains from RANDOM INIT -- do not resume from any unconditional checkpoint.
+#
+#   uv run python scripts/train.py --config configs/train/conditional.yaml --seed 42
+#
+
+# --- Text conditioning ---
+# Requires data/v1/text_embeddings.pt to exist.
+# train.py raises FileNotFoundError on startup if the cache is missing.
+# Silently running unconditional is NOT permitted when this flag is true.
+text_conditioning: true
+
+# --- Model (same as v3 baseline -- d_model=256, ~8.9M params) ---
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+
+# --- Diffusion schedule ---
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+# --- Training loop ---
+training:
+  batch_size: 128
+  lr: 3.0e-4
+  warmup_steps: 1000
+  max_steps: 100000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000
+  val_every_epochs: 10
+  val_n_scenes: 100
+  dtype: "float32"
+  weighted_sampling: true
+
+# --- Loss weights (v3 Pareto optimum) ---
+# presence_bce=1.0 is the Pareto-optimal value from the ablation:
+#   v2 pres=0.5: validity 1.4%, mean count 6.40
+#   v3 pres=1.0: validity 5.4%, mean count 4.66  <- chosen baseline
+#   v4 pres=2.0: validity 8.6%, mean count 3.73, Probe B regresses
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 0.1
+  presence_bce: 1.0   # v3 Pareto optimum
+
+# --- Dataset ---
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  # DataLoader workers: num_workers=2 with deterministic worker_init_fn.
+  # If this causes issues (IPC errors, nondeterminism), revert to 0.
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+# --- Output ---
+output:
+  dir: "checkpoints/conditional_v1"
+
+# --- W&B ---
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v1"
+  tags: ["model", "week3", "conditional", "d256", "v1", "pres1.0", "text-conditioned"]

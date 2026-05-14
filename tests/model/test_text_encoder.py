@@ -7,13 +7,11 @@ of the actual model weights.
 from __future__ import annotations
 
 import hashlib
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -43,7 +41,7 @@ def _make_mock_st(d_text: int = 384) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-def _make_encoder(tmp_path: Path, mock_st: MagicMock | None = None) -> "TextEncoder":  # noqa: F821
+def _make_encoder(tmp_path: Path, mock_st: MagicMock | None = None) -> TextEncoder:  # noqa: F821
     """Construct a TextEncoder with a mocked SentenceTransformer."""
     from model.text_encoder import TextEncoder
 
@@ -201,7 +199,7 @@ class TestCachePersistence:
             assert v.dtype == torch.float32
 
     def test_cache_round_trip(self, tmp_path: Path) -> None:
-        from model.text_encoder import TextEncoder, description_hash
+        from model.text_encoder import description_hash
 
         enc1 = _make_encoder(tmp_path)
         text = "place the mug on the table"
