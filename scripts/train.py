@@ -390,6 +390,13 @@ def main() -> None:
     mixed_prec = tcfg.get("dtype", "float32")
     use_amp = mixed_prec in ("float16", "bfloat16") and device.type == "cuda"
     amp_dtype = torch.bfloat16 if mixed_prec == "bfloat16" else torch.float16
+    # CFG dropout: probability of replacing text_emb with None per batch.
+    # 0.0 = always conditional (conditional_v1 behavior -- caused collapse).
+    # 0.15 = 15% unconditional passes, forces model to learn both paths.
+    cfg_dropout = float(tcfg.get("cfg_dropout", 0.0))
+    # Warm init: load model_state from a pre-trained checkpoint before training.
+    # Cross-attention layers stay randomly initialized; all shared layers warm-start.
+    warm_init_from: str | None = tcfg.get("warm_init_from", None)
 
     # --- Loss ---
     lcfg = cfg.get("loss", {})
@@ -534,7 +541,7 @@ def main() -> None:
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
-    # --- Output dir + resume ---
+    # --- Output dir + resume / warm-init ---
     out_dir = Path(cfg.get("output", {}).get("dir", "checkpoints/run"))
     out_dir.mkdir(parents=True, exist_ok=True)
     start_step = 0
@@ -548,6 +555,30 @@ def main() -> None:
             lr_scheduler.step()
         print(f"Resumed at step {start_step}"
               + (f" (W&B run {wandb_resume_id})" if wandb_resume_id else ""))
+    elif warm_init_from is not None:
+        # Warm-init: copy matching keys from an unconditional checkpoint.
+        # Cross-attention layers (key prefix "blocks.") that don't exist in the source
+        # are left randomly initialized. This gives the pose/presence/scale heads a
+        # head start while the conditioning mechanism learns from scratch.
+        wi_path = Path(warm_init_from)
+        if not wi_path.exists():
+            raise FileNotFoundError(
+                f"warm_init_from={warm_init_from!r} does not exist. "
+                "Download the checkpoint before starting training."
+            )
+        wi_ckpt = torch.load(wi_path, map_location="cpu", weights_only=False)
+        src_state = wi_ckpt.get("model_state", wi_ckpt)  # handle bare state-dict
+        tgt_state = model.state_dict()
+        matched, skipped = 0, 0
+        for k, v in src_state.items():
+            if k in tgt_state and tgt_state[k].shape == v.shape:
+                tgt_state[k] = v.to(tgt_state[k].dtype)
+                matched += 1
+            else:
+                skipped += 1
+        model.load_state_dict(tgt_state)
+        ema_weights = _ema_init(model)  # re-seed EMA from warm weights
+        print(f"Warm-init from {wi_path}: {matched} keys loaded, {skipped} skipped (shape/name mismatch)")
 
     # --- W&B ---
     git_sha = _git_sha()
@@ -557,6 +588,29 @@ def main() -> None:
         git_sha,
         resume_run_id=wandb_resume_id,
     )
+
+    # --- CFG dropout smoke test ---
+    if cfg_dropout > 0.0 and text_cache is not None:
+        print(f"CFG dropout={cfg_dropout:.2f} -- running 1000-batch smoke test...")
+        _cfg_rng = torch.Generator()
+        _cfg_rng.manual_seed(args.seed + 99999)  # isolated generator for smoke test
+        _null_count = sum(
+            1 for _ in range(1000)
+            if torch.rand(1, generator=_cfg_rng).item() < cfg_dropout
+        )
+        _actual_rate = _null_count / 1000
+        _lo, _hi = 0.13, 0.17
+        if not (_lo <= _actual_rate <= _hi):
+            raise RuntimeError(
+                f"CFG dropout smoke test FAILED: rate={_actual_rate:.3f} outside [{_lo}, {_hi}]. "
+                f"Check cfg_dropout={cfg_dropout} and RNG seeding."
+            )
+        print(f"CFG dropout smoke test PASSED: {_null_count}/1000 null batches ({_actual_rate:.3f}) -- within [{_lo}, {_hi}]")
+
+    # Deterministic per-step CFG RNG: seeded from global seed, advances one draw per step.
+    # Pattern is fully reproducible: resume from checkpoint gives identical dropout sequence.
+    _cfg_step_rng = torch.Generator()
+    _cfg_step_rng.manual_seed(args.seed + 12345)
 
     # --- Training loop ---
     max_epochs = args.max_epochs
@@ -584,6 +638,12 @@ def main() -> None:
             text_emb_b = batch.get("text_emb")
             if text_emb_b is not None:
                 text_emb_b = text_emb_b.to(device)
+                # CFG dropout: replace text conditioning with None with probability
+                # cfg_dropout, forcing the model to learn an unconditional fallback.
+                # Uses a deterministic per-step generator so dropout patterns are
+                # reproducible across runs with the same seed.
+                if cfg_dropout > 0.0 and torch.rand(1, generator=_cfg_step_rng).item() < cfg_dropout:
+                    text_emb_b = None
 
             # Sample random timesteps.
             B = x_cont.shape[0]

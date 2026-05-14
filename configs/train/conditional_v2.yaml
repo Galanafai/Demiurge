@@ -1,0 +1,84 @@
+# Training configuration for Demiurge conditional DDPM -- conditional_v2
+#
+# Fixes conditional_v1 (CASE 3) by adding CFG dropout (p=0.15).
+# Warm-init from unconditional_v3 (Pareto optimum baseline, step=100k).
+#
+#   uv run python scripts/train.py --config configs/train/conditional_v2.yaml --seed 42
+#
+# Key differences from conditional_v1:
+#   - training.cfg_dropout: 0.15  (was 0.0 -- the CASE 3 root cause)
+#   - training.warm_init_from: unconditional_v3 checkpoint
+#   - dataset.num_workers: 4  (up from 2)
+#   - output.dir: checkpoints/conditional_v2
+
+# --- Text conditioning ---
+# Requires data/v1/text_embeddings.pt to exist.
+# train.py raises FileNotFoundError on startup if the cache is missing.
+text_conditioning: true
+
+# --- Model (same d_model=256 as all Week 3 runs) ---
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+
+# --- Diffusion schedule ---
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+# --- Training loop ---
+training:
+  batch_size: 128
+  lr: 3.0e-4
+  warmup_steps: 1000
+  max_steps: 100000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000
+  val_every_epochs: 10
+  val_n_scenes: 100
+  dtype: "float32"
+  weighted_sampling: true
+
+  # CFG dropout: 0.15 forces model to learn unconditional fallback.
+  # This was 0.0 in conditional_v1, which caused presence collapse at inference.
+  cfg_dropout: 0.15
+
+  # Warm-init from unconditional_v3 (presence_bce=1.0, validity=5.4%).
+  # Cross-attention layers start random; all other layers warm-start.
+  # This gives the model a head start on presence/pose/scale from v3.
+  warm_init_from: checkpoints/unconditional_v3_pres1.0/latest.pt
+  warm_init_keys: model_state
+
+# --- Loss weights (v3 Pareto optimum, unchanged) ---
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 0.1
+  presence_bce: 1.0
+
+# --- Dataset ---
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+# --- Output ---
+output:
+  dir: "checkpoints/conditional_v2"
+
+# --- W&B ---
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v2"
+  tags: ["model", "week3.5", "conditional", "d256", "v2", "pres1.0", "cfg0.15", "warm-init-v3"]

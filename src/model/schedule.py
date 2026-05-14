@@ -281,3 +281,81 @@ class DDIMSampler:
             x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
 
         return x_t
+
+    @torch.no_grad()
+    def sample_cfg(
+        self,
+        cond_fn: Callable[[Tensor, Tensor, Tensor | None], Tensor],
+        uncond_fn: Callable[[Tensor, Tensor, Tensor | None], Tensor],
+        shape: tuple[int, ...],
+        guidance_scale: float = 3.0,
+        seed: int | None = None,
+        device: torch.device | str = "cpu",
+    ) -> Tensor:
+        """Generate samples via DDIM with classifier-free guidance.
+
+        Requires two forward passes per denoising step:
+            eps_pred = uncond_eps + w * (cond_eps - uncond_eps)
+
+        Args:
+            cond_fn: Noise prediction callable with text conditioning.
+                Signature: ``(x_t, t, text_emb) -> eps_pred``.
+            uncond_fn: Noise prediction callable without text conditioning.
+                Signature: ``(x_t, t, None) -> eps_pred``.
+            shape: Output shape ``(B, ...)``.
+            guidance_scale: CFG scale w. 1.0 = no guidance (same as uncond).
+                Typical range 2.0-7.5; higher amplifies conditioning signal.
+            seed: Optional integer seed for the initial Gaussian noise.
+            device: Device on which to run sampling.
+
+        Returns:
+            Denoised sample x_0. Shape: ``shape``.
+        """
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(seed)
+        else:
+            generator = None
+
+        x_t = torch.randn(shape, device=device, generator=generator)
+        B = shape[0]
+        sched = self.schedule
+
+        for i, t_val in enumerate(self._timesteps):
+            t_tensor = torch.full((B,), t_val, dtype=torch.long, device=device)
+
+            # Two forward passes: conditional and unconditional.
+            # Both callables wrap text_emb in their closure; the 3rd argument
+            # is ignored by noise_prediction_fn's returned _fn.
+            eps_cond = cond_fn(x_t, t_tensor, None)
+            eps_uncond = uncond_fn(x_t, t_tensor, None)
+
+            # CFG combination.
+            eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+            # DDIM update (identical to sample()).
+            ab_t = sched.alpha_bar(t_tensor)
+            if i + 1 < len(self._timesteps):
+                t_prev_val = self._timesteps[i + 1]
+            else:
+                t_prev_val = 0
+            t_prev = torch.full((B,), t_prev_val, dtype=torch.long, device=device)
+            ab_prev = sched.alpha_bar(t_prev)
+
+            extra_dims = x_t.dim() - 1
+            view = (-1,) + (1,) * extra_dims
+            ab_t_v = ab_t.view(view).to(device)
+            ab_prev_v = ab_prev.view(view).to(device)
+
+            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            x0_pred = x0_pred.clamp(-10.0, 10.0)
+
+            sigma = (
+                self.eta
+                * ((1.0 - ab_prev_v) / (1.0 - ab_t_v)).sqrt()
+                * (1.0 - ab_t_v / ab_prev_v).sqrt()
+            )
+            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_pred
+            noise = sigma * torch.randn_like(x_t)
+            x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
+
+        return x_t
