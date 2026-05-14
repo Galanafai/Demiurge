@@ -45,14 +45,15 @@ training:
   weighted_sampling: true
 
 # --- Loss weights ---
-# unconditional_v3: presence_bce raised 2x (0.5 -> 1.0) to further reduce
-# mean object count (v2 mean=6.4, target=~2.5). One variable at a time.
+# unconditional_v4: presence_bce raised 2x (1.0 -> 2.0). Testing whether the
+# raw BCE equilibrium (0.063 in v2 and v3) shifts, or the loss floor is real.
+# One variable at a time.
 loss:
   pose_xyz: 1.0
   pose_rot: 1.0
-  scale: 0.7          # bumped from 0.5 in v2
+  scale: 0.7
   type_ce: 0.1
-  presence_bce: 1.0   # was 0.5 in v2 -- 2x step
+  presence_bce: 2.0   # was 1.0 in v3 -- testing loss floor hypothesis
 
 # --- Dataset ---
 dataset:
@@ -66,7 +67,7 @@ dataset:
 
 # --- Output ---
 output:
-  dir: "checkpoints/unconditional_v3"
+  dir: "checkpoints/unconditional_v4"
 
 # --- W&B ---
 # If wandb.enabled=true, WANDB_API_KEY must be set in the environment.
@@ -75,5 +76,5 @@ output:
 wandb:
   enabled: true
   project: "demiurge"
-  experiment: "unconditional_v3"
-  tags: ["model", "week3", "unconditional", "d256", "v3", "pres1.0"]
+  experiment: "unconditional_v4"
+  tags: ["model", "week3", "unconditional", "d256", "v4", "pres2.0"]
