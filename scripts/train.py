@@ -85,8 +85,17 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _init_wandb(cfg: dict[str, Any], run_cfg: dict[str, Any], git_sha: str) -> Any:
-    """Initialise W&B run. Raises EnvironmentError if API key is absent."""
+def _init_wandb(
+    cfg: dict[str, Any],
+    run_cfg: dict[str, Any],
+    git_sha: str,
+    resume_run_id: str | None = None,
+) -> Any:
+    """Initialise W&B run. Raises EnvironmentError if API key is absent.
+
+    When resume_run_id is provided (restored from checkpoint), the run
+    is resumed with resume='must' so curves are continuous across restarts.
+    """
     wcfg = cfg.get("wandb", {})
     if not wcfg.get("enabled", False):
         return None
@@ -98,12 +107,21 @@ def _init_wandb(cfg: dict[str, Any], run_cfg: dict[str, Any], git_sha: str) -> A
             "Do not use WANDB_MODE=offline for production GPU runs."
         )
     import wandb
-    run = wandb.init(
-        project=wcfg.get("project", "demiurge"),
-        name=wcfg.get("experiment", "unnamed"),
-        tags=wcfg.get("tags", []),
-        config={**run_cfg, "git_sha": git_sha},
-    )
+    if resume_run_id:
+        run = wandb.init(
+            project=wcfg.get("project", "demiurge"),
+            id=resume_run_id,
+            resume="must",
+            tags=wcfg.get("tags", []),
+            config={**run_cfg, "git_sha": git_sha},
+        )
+    else:
+        run = wandb.init(
+            project=wcfg.get("project", "demiurge"),
+            name=wcfg.get("experiment", "unnamed"),
+            tags=wcfg.get("tags", []),
+            config={**run_cfg, "git_sha": git_sha},
+        )
     return run
 
 
@@ -134,6 +152,7 @@ def save_checkpoint(
     ema_weights: dict[str, torch.Tensor],
     optimizer: torch.optim.Optimizer,
     dcfg: DenoiserConfig,
+    wandb_run_id: str | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt = {
@@ -142,6 +161,7 @@ def save_checkpoint(
         "ema_state": ema_weights,
         "optimizer_state": optimizer.state_dict(),
         "arch": _arch_fingerprint(dcfg),
+        "wandb_run_id": wandb_run_id,  # persists run identity across restarts
     }
     path = out_dir / f"step_{step:08d}.pt"
     torch.save(ckpt, path)
@@ -157,8 +177,12 @@ def load_checkpoint(
     model: SceneDenoiser,
     optimizer: torch.optim.Optimizer,
     dcfg: DenoiserConfig,
-) -> tuple[int, dict[str, torch.Tensor]]:
-    """Load checkpoint; raises ConfigMismatchError if architecture differs."""
+) -> tuple[int, dict[str, torch.Tensor], str | None]:
+    """Load checkpoint; raises ConfigMismatchError if architecture differs.
+
+    Returns (step, ema_weights, wandb_run_id). wandb_run_id is None for
+    checkpoints saved before this field was added.
+    """
     ckpt = torch.load(latest, weights_only=False)
     saved_arch = ckpt.get("arch", {})
     current_arch = _arch_fingerprint(dcfg)
@@ -170,7 +194,7 @@ def load_checkpoint(
         )
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    return int(ckpt["step"]), dict(ckpt["ema_state"])
+    return int(ckpt["step"]), dict(ckpt["ema_state"]), ckpt.get("wandb_run_id")
 
 
 # ---------------------------------------------------------------------------
@@ -471,17 +495,24 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     start_step = 0
     ema_weights = _ema_init(model)
+    wandb_resume_id: str | None = None
     latest = out_dir / "latest.pt"
     if latest.exists():
         print(f"Resuming from {latest}")
-        start_step, ema_weights = load_checkpoint(latest, model, optimizer, dcfg)
+        start_step, ema_weights, wandb_resume_id = load_checkpoint(latest, model, optimizer, dcfg)
         for _ in range(start_step):
             lr_scheduler.step()
-        print(f"Resumed at step {start_step}")
+        print(f"Resumed at step {start_step}"
+              + (f" (W&B run {wandb_resume_id})" if wandb_resume_id else ""))
 
     # --- W&B ---
     git_sha = _git_sha()
-    wandb_run = _init_wandb(cfg, {**cfg, "seed": args.seed, "git_sha": git_sha, "n_params": n_params}, git_sha)
+    wandb_run = _init_wandb(
+        cfg,
+        {**cfg, "seed": args.seed, "git_sha": git_sha, "n_params": n_params},
+        git_sha,
+        resume_run_id=wandb_resume_id,
+    )
 
     # --- Training loop ---
     max_epochs = args.max_epochs
@@ -570,7 +601,8 @@ def main() -> None:
                     wandb_run.log(log_dict, step=step)
 
                 if step % ckpt_steps == 0:
-                    save_checkpoint(out_dir, step, model, ema_weights, optimizer, dcfg)
+                    save_checkpoint(out_dir, step, model, ema_weights, optimizer, dcfg,
+                                    wandb_run_id=wandb_run.id if wandb_run else None)
                     print(f"  [step {step}] checkpoint saved")
 
                 if step % 100 == 0:
@@ -605,7 +637,8 @@ def main() -> None:
         print("=========================")
 
     # Final checkpoint.
-    save_checkpoint(out_dir, step, model, ema_weights, optimizer, dcfg)
+    save_checkpoint(out_dir, step, model, ema_weights, optimizer, dcfg,
+                    wandb_run_id=wandb_run.id if wandb_run else None)
     print(f"Training complete at step {step}. Checkpoint saved to {out_dir}/latest.pt")
 
     if wandb_run is not None:
