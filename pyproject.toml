@@ -12,7 +12,8 @@ dependencies = [
     # Drake and PyTorch are pinned exactly per AGENTS.md tooling discipline.
     # drake 1.52.0+ dropped the Python 3.11 wheel; 1.51.1 is the latest cp311 release.
     "drake==1.51.1",
-    "torch==2.7.1",
+    "torch>=2.4.0,<3",
+
     # Remaining runtime dependencies use compatible-release pins.
     "numpy>=2.4.0,<3.0.0",
     "einops==0.8.2",
