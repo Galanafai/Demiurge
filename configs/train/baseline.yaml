@@ -45,12 +45,15 @@ training:
   weighted_sampling: true
 
 # --- Loss weights ---
+# unconditional_v2: presence_bce raised 10x (0.05 -> 0.5) to fix mode collapse
+# to all-12-slots-present observed in v1. scale raised 0.5->0.7 to maintain
+# relative balance after presence bump.
 loss:
   pose_xyz: 1.0
   pose_rot: 1.0
-  scale: 0.5
+  scale: 0.7          # bumped from 0.5 (was ~10% of loss, now ~14%)
   type_ce: 0.1
-  presence_bce: 0.05
+  presence_bce: 0.5   # CRITICAL FIX: was 0.05 -- mode collapse to 9-12 objs
 
 # --- Dataset ---
 dataset:
@@ -64,7 +67,7 @@ dataset:
 
 # --- Output ---
 output:
-  dir: "checkpoints/unconditional_v1"
+  dir: "checkpoints/unconditional_v2"
 
 # --- W&B ---
 # If wandb.enabled=true, WANDB_API_KEY must be set in the environment.
@@ -73,5 +76,5 @@ output:
 wandb:
   enabled: true
   project: "demiurge"
-  experiment: "unconditional_v1"
-  tags: ["model", "week3", "unconditional", "d256", "50k"]
+  experiment: "unconditional_v2"
+  tags: ["model", "week3", "unconditional", "d256", "v2", "pres-fix"]
