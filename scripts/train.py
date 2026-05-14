@@ -313,11 +313,13 @@ def run_validation(
             quats = rot6d_to_quat_wxyz(rot6d_pred[i])             # (N_MAX, 4)
             poses_raw = torch.cat([xyz[i], quats], dim=-1)        # (N_MAX, 7)
             types = torch.zeros(N_MAX, dtype=torch.long)
+            # Drake runs on CPU; move decoded tensors from CUDA to CPU before
+            # constructing SceneTensor. denormalize() uses CPU bounds tensors.
             st_norm = SceneTensor(
                 object_types=types,
-                poses=poses_raw,
-                scales=scale_pred[i],
-                presence=pres_mask,
+                poses=poses_raw.cpu(),
+                scales=scale_pred[i].cpu(),
+                presence=pres_mask.cpu(),
             )
             st = st_norm.denormalize(bounds)
             rpt = validator.validate(st)
