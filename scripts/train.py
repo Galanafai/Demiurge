@@ -183,7 +183,7 @@ def load_checkpoint(
     Returns (step, ema_weights, wandb_run_id). wandb_run_id is None for
     checkpoints saved before this field was added.
     """
-    ckpt = torch.load(latest, weights_only=False)
+    ckpt = torch.load(latest, map_location="cpu", weights_only=False)
     saved_arch = ckpt.get("arch", {})
     current_arch = _arch_fingerprint(dcfg)
     if saved_arch != current_arch:
@@ -192,9 +192,13 @@ def load_checkpoint(
             f"{current_arch}. Cannot resume -- create a new output directory or "
             "match the config to the checkpoint."
         )
-    model.load_state_dict(ckpt["model_state"])
+    model.load_state_dict(ckpt["model_state"])  # model already on device; this broadcasts
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    return int(ckpt["step"]), dict(ckpt["ema_state"]), ckpt.get("wandb_run_id")
+    # EMA was saved from whichever device the training run used. Move to the
+    # current model device so _ema_update doesn't hit a device mismatch.
+    model_device = next(model.parameters()).device
+    ema = {k: v.to(model_device).float() for k, v in ckpt["ema_state"].items()}
+    return int(ckpt["step"]), ema, ckpt.get("wandb_run_id")
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +215,9 @@ def _ema_update(
 ) -> None:
     with torch.no_grad():
         for k, v in model.state_dict().items():
-            # EMA tensors are stored on CPU; move model param to CPU for update.
-            ema[k].mul_(decay).add_(v.float().cpu(), alpha=1.0 - decay)
+            # EMA and model are both on the same device (CUDA during GPU runs).
+            # The 35MB EMA copy is negligible on a 24GB card.
+            ema[k].mul_(decay).add_(v.float(), alpha=1.0 - decay)
 
 
 # ---------------------------------------------------------------------------

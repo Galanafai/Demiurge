@@ -63,7 +63,7 @@ dataset:
   # tabletop_reach: indices [20218, 20318), obstacle_avoidance: [15821, 15921),
   # cluttered_pick: [8064, 8164). Pre-tracking block treated as train-only.
   held_out_per_template: 100
-  num_workers: 4
+  num_workers: 0        # dataset is in-RAM; workers add IPC overhead with no IO benefit
 
 # --- Output ---
 output:
