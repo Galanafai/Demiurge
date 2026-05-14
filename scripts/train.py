@@ -211,7 +211,8 @@ def _ema_update(
 ) -> None:
     with torch.no_grad():
         for k, v in model.state_dict().items():
-            ema[k].mul_(decay).add_(v.float(), alpha=1.0 - decay)
+            # EMA tensors are stored on CPU; move model param to CPU for update.
+            ema[k].mul_(decay).add_(v.float().cpu(), alpha=1.0 - decay)
 
 
 # ---------------------------------------------------------------------------
