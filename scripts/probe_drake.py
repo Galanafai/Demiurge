@@ -148,6 +148,12 @@ def main() -> None:
         "--drake-workers", type=int, default=1,
         help="Parallel CPU workers for Drake validation (1 = serial)",
     )
+    p.add_argument(
+        "--cfg-scale", type=float, default=1.0,
+        help="CFG guidance scale: 0.0=unconditional, 1.0=pure conditional (default). "
+             "For v7+ checkpoints trained with cfg_dropout>0, values in [0,5] give "
+             "smooth monotone tradeoff between validity and text-following.",
+    )
     p.add_argument("--out", default=None, help="JSON output path")
     args = p.parse_args()
 
@@ -227,7 +233,19 @@ def main() -> None:
             else:
                 text_emb = None
 
-            sampling_fn = model.conditional_sampling_fn(text_emb=text_emb)
+            # Build sampling function with optional CFG interpolation.
+            cfg_scale = args.cfg_scale
+            if cfg_scale == 0.0 or text_emb is None:
+                sampling_fn = model.conditional_sampling_fn(text_emb=None)
+            elif cfg_scale == 1.0:
+                sampling_fn = model.conditional_sampling_fn(text_emb=text_emb)
+            else:
+                _uncond_fn = model.conditional_sampling_fn(text_emb=None)
+                _cond_fn = model.conditional_sampling_fn(text_emb=text_emb)
+                def sampling_fn(x_t, type_ids_arg, t):
+                    eps_u, logits_u = _uncond_fn(x_t, type_ids_arg, t)
+                    eps_c, logits_c = _cond_fn(x_t, type_ids_arg, t)
+                    return eps_u + cfg_scale * (eps_c - eps_u), logits_c
             x_cont, type_ids_batch = sampler.sample_with_types(
                 sampling_fn, (b, N_MAX, 13),
                 seed=rng_seed, device=device,
