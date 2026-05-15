@@ -30,7 +30,7 @@ def _small_classifier() -> ValidityClassifier:
 
 
 def test_guided_sampler_modifies_trajectory() -> None:
-    """With guidance_scale > 0, sampled x0 must differ from w=0 baseline."""
+    """With guidance_scale > 0, sampled eps must differ from w=0 baseline."""
     torch.manual_seed(42)
     device = torch.device("cpu")
     schedule = CosineSchedule(T=1000)
@@ -40,16 +40,14 @@ def test_guided_sampler_modifies_trajectory() -> None:
     classifier = _small_classifier()
     classifier.eval()
 
-    # We test the _guided_noise_fn output directly rather than full DDIM
-    # (DDIM sampling requires text_encoder which is heavy to instantiate in tests).
     text_emb = torch.randn(1, 384)  # (1, D_TEXT)
 
     guided_sampler = ClassifierGuidedSampler(
         model=denoiser,
         classifier=classifier,
         schedule=schedule,
-        text_encoder=None,  # type: ignore[arg-type]  -- not used in _guided_noise_fn test
-        bounds=None,         # type: ignore[arg-type]  -- not used in fn test
+        text_encoder=None,  # type: ignore[arg-type]
+        bounds=None,         # type: ignore[arg-type]
         guidance_scale=2.0,
         mode="continuous",
         device=device,
@@ -65,16 +63,17 @@ def test_guided_sampler_modifies_trajectory() -> None:
         device=device,
     )
 
-    # Generate guided and unguided noise predictions from same x_t.
+    # New fn signature: (x_t, type_ids, t_idx) -> (eps, type_logits)
     x_t = torch.randn(1, N_MAX, N_CONT)
+    type_ids = torch.zeros(1, N_MAX, dtype=torch.long)
     t_idx = torch.tensor([500])
 
     guided_fn = guided_sampler._guided_noise_fn(text_emb)
     unguided_fn = unguided_sampler._guided_noise_fn(text_emb)
 
     with torch.no_grad():
-        eps_guided = guided_fn(x_t, t_idx, None)
-    eps_unguided = unguided_fn(x_t, t_idx, None)
+        eps_guided, _ = guided_fn(x_t, type_ids, t_idx)
+    eps_unguided, _ = unguided_fn(x_t, type_ids, t_idx)
 
     diff = (eps_guided - eps_unguided).abs().max().item()
     assert diff > 1e-6, (
@@ -89,7 +88,7 @@ def test_guided_sampler_modifies_trajectory() -> None:
 
 
 def test_zero_guidance_equals_unguided() -> None:
-    """With guidance_scale=0.0, output must match denoiser alone (no modification)."""
+    """With guidance_scale=0.0, output eps must match denoiser alone."""
     torch.manual_seed(7)
     device = torch.device("cpu")
     schedule = CosineSchedule(T=1000)
@@ -108,15 +107,15 @@ def test_zero_guidance_equals_unguided() -> None:
     )
 
     x_t = torch.randn(1, N_MAX, N_CONT)
+    type_ids = torch.zeros(1, N_MAX, dtype=torch.long)
     t_idx = torch.tensor([200])
 
     fn_0 = sampler_0._guided_noise_fn(text_emb)
 
     with torch.no_grad():
-        eps_w0 = fn_0(x_t, t_idx, None)
+        eps_w0, _ = fn_0(x_t, type_ids, t_idx)
 
         # Direct denoiser output for comparison.
-        type_ids = torch.zeros(1, N_MAX, dtype=torch.long)
         out = denoiser(x_t, type_ids, t_idx, text_emb)
         eps_direct = torch.cat([out.xyz, out.rot6d, out.scale, out.presence_logit], dim=-1)
 
@@ -147,40 +146,38 @@ def test_gradient_clipping_applied() -> None:
     sampler = ClassifierGuidedSampler(
         model=denoiser, classifier=classifier, schedule=schedule,
         text_encoder=None, bounds=None,  # type: ignore
-        guidance_scale=8.0,   # high scale to stress test clipping
+        guidance_scale=8.0,
         mode="continuous",
         grad_clip_norm=clip_norm,
         device=device,
     )
 
-    # Patch _guided_noise_fn to expose intermediate grad for inspection.
+    # Instrument to capture raw gradient norms before clipping.
     captured_grad_norms = []
     _original_fn_factory = sampler._guided_noise_fn
 
     def _instrumented_fn_factory(text_emb_inner):
         base_fn = _original_fn_factory(text_emb_inner)
 
-        def _wrapped(x_t, t_idx, _):
+        def _wrapped(x_t, type_ids, t_idx):
+            # Capture raw grad norm before clipping.
             x_t_grad = x_t.detach().requires_grad_(True)
-            type_ids_g = torch.zeros(x_t.shape[0], N_MAX, dtype=torch.long)
-            log_p = classifier.log_prob_valid(x_t_grad, type_ids_g, t_idx)
+            log_p = classifier.log_prob_valid(x_t_grad, type_ids, t_idx)
             log_p.sum().backward()
             grad = x_t_grad.grad.detach()
             grad_norm = grad.norm(dim=(-2, -1)).max().item()
             captured_grad_norms.append(grad_norm)
-            return base_fn(x_t, t_idx, _)
+            return base_fn(x_t, type_ids, t_idx)
 
         return _wrapped
 
     sampler._guided_noise_fn = _instrumented_fn_factory  # type: ignore[method-assign]
 
     x_t = torch.randn(2, N_MAX, N_CONT)
+    type_ids = torch.zeros(2, N_MAX, dtype=torch.long)
     t_idx = torch.tensor([500, 300])
     fn = sampler._guided_noise_fn(text_emb)
-    fn(x_t, t_idx, None)
+    fn(x_t, type_ids, t_idx)
 
-    # The raw gradient norm before clipping may exceed clip_norm, but the
-    # output eps_guided must reflect clipping. We verify the captured raw norms
-    # and trust the clipping code path is exercised.
     assert len(captured_grad_norms) > 0, "Gradient norm capture failed."
     # eps_guided uses clipped grad; pass if no exception was raised.
