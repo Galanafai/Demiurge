@@ -208,7 +208,7 @@ class ClassifierGuidedSampler:
     def _sample_one(self, prompt: str) -> SceneTensor:
         """Sample a single scene with guidance using sample_with_types."""
         with torch.no_grad():
-            text_emb = self._text_encoder.encode([prompt]).to(self._device)  # (1, D_TEXT)
+            text_emb = self._text_encoder.encode_batch([prompt]).to(self._device)  # (1, D_TEXT)
 
         guided_fn = self._guided_noise_fn(text_emb)
 

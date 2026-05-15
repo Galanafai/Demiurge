@@ -249,14 +249,13 @@ def main() -> None:
     model, schedule, bounds = _load_model(args.model_config, args.model_checkpoint, device)
 
     print("Loading text encoder ...")
-    text_encoder = TextEncoder()
-    text_encoder.eval()
-
-    # Preload text embeddings cache if available.
     emb_cache = _ROOT / "data" / "v1" / "text_embeddings.pt"
+    text_encoder = TextEncoder(
+        device=device,
+        cache_path=str(emb_cache) if emb_cache.exists() else None,
+    )
     if emb_cache.exists():
-        text_encoder.load_cache(str(emb_cache))
-        print("Text embedding cache loaded.")
+        print(f"Text embedding cache loaded ({text_encoder.cache_size} entries).")
 
     print("Loading classifier ...")
     cls_ckpt = Path(args.classifier_checkpoint)

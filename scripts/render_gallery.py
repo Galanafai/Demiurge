@@ -151,8 +151,11 @@ def main() -> None:
     else:
         print(f"WARNING: classifier not found at {cls_ckpt}. Using unguided sampling.")
 
-    text_encoder = TextEncoder()
-    text_encoder.eval()
+    emb_cache_path = _ROOT / "data" / "v1" / "text_embeddings.pt"
+    text_encoder = TextEncoder(
+        device=device,
+        cache_path=str(emb_cache_path) if emb_cache_path.exists() else None,
+    )
 
     sampler = ClassifierGuidedSampler(
         model=model,

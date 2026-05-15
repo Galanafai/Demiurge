@@ -113,7 +113,7 @@ class RejectionSampler:
     @torch.no_grad()
     def _encode_prompt(self, prompt: str) -> torch.Tensor:
         """Encode a single prompt to text embedding (1, D_TEXT)."""
-        return self._text_encoder.encode([prompt]).to(self._device)
+        return self._text_encoder.encode_batch([prompt]).to(self._device)
 
     def _sample_one_prompt(
         self,
