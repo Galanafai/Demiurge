@@ -58,7 +58,9 @@ from model.rotations import quat_wxyz_to_6d  # noqa: E402
 from model.schedule import CosineSchedule  # noqa: E402
 from scene.schema import N_MAX, SceneTensor, WorkspaceBounds  # noqa: E402
 
-_PERTURB_M: float = 0.3  # XYZ perturbation in metres (physical space)
+_PERTURB_M: float = 0.3  # Default XYZ perturbation in metres
+
+_CORRUPTION_TYPES = ("xyz_shift", "scale_extreme", "object_removal")
 
 
 def _scene_to_x0(scene: SceneTensor, bounds: WorkspaceBounds) -> torch.Tensor:
@@ -89,48 +91,87 @@ def _corrupt_scene(
     scene: SceneTensor,
     bounds: WorkspaceBounds,
     rng: random.Random,
+    perturb_m: float = _PERTURB_M,
+    multi_type: bool = False,
 ) -> SceneTensor | None:
-    """Perturb one present object's xyz by +/-_PERTURB_M.
+    """Perturb a scene to produce a likely-invalid variant.
 
-    Returns corrupted SceneTensor, or None if:
-    - No present slots (shouldn't happen in training data)
-    - Perturbed position stays within workspace bounds (valid -- discard)
+    When multi_type=False: xyz shift only (original behavior).
+    When multi_type=True: randomly selects from:
+      - xyz_shift (50%): shift one object's position by +/-perturb_m
+      - scale_extreme (25%): set one object's scale to 3x or 0.1x normal
+      - object_removal (25%): remove all objects except one (degenerate scene)
 
-    # APPROX: no_interpenetration only -- perturbed object is checked to be
-    # outside workspace bounds as a proxy for Drake invalidity. This avoids
-    # full Drake RRT on 50k corrupted scenes (~14 CPU-hours).
+    Returns corrupted SceneTensor, or None if the corruption stayed valid
+    (workspace bounds proxy check for xyz_shift; always invalid for others).
+
+    # APPROX: corrupted-scene invalidity is verified by workspace bounds proxy
+    # for xyz_shift only. scale_extreme and object_removal are assumed invalid
+    # without Drake verification, as they produce degenerate geometry.
+    # Invariant relaxed: no_interpenetration proxy only (not ik_reachable/rrt_solvable).
     """
     present_slots = [i for i in range(N_MAX) if scene.presence[i]]
     if not present_slots:
         return None
 
-    slot = rng.choice(present_slots)
+    # Select corruption type.
+    if multi_type:
+        r = rng.random()
+        if r < 0.50:
+            corruption = "xyz_shift"
+        elif r < 0.75:
+            corruption = "scale_extreme"
+        else:
+            corruption = "object_removal"
+    else:
+        corruption = "xyz_shift"
 
-    # Clone and perturb in physical space.
-    new_poses = scene.poses.clone()
-    delta = torch.zeros(3)
-    axis = rng.randint(0, 2)  # 0=x, 1=y, 2=z
-    sign = rng.choice([-1.0, 1.0])
-    delta[axis] = sign * _PERTURB_M
-    new_poses[slot, :3] = new_poses[slot, :3] + delta
+    if corruption == "xyz_shift":
+        slot = rng.choice(present_slots)
+        new_poses = scene.poses.clone()
+        delta = torch.zeros(3)
+        axis = rng.randint(0, 2)
+        sign = rng.choice([-1.0, 1.0])
+        delta[axis] = sign * perturb_m
+        new_poses[slot, :3] = new_poses[slot, :3] + delta
+        corrupted = SceneTensor(
+            object_types=scene.object_types.clone(),
+            poses=new_poses,
+            scales=scene.scales.clone(),
+            presence=scene.presence.clone(),
+        )
+        # APPROX: workspace bounds proxy check.
+        normalised = corrupted.normalize(bounds)
+        norm_xyz = normalised.poses[slot, :3]
+        if norm_xyz.abs().max().item() <= 1.0:
+            return None  # shift stayed within workspace -- discard
+        return corrupted
 
-    corrupted = SceneTensor(
-        object_types=scene.object_types.clone(),
-        poses=new_poses,
-        scales=scene.scales.clone(),
-        presence=scene.presence.clone(),
-    )
+    elif corruption == "scale_extreme":
+        slot = rng.choice(present_slots)
+        new_scales = scene.scales.clone()
+        # Either 3x oversized or 0.1x (tiny) -- both physically degenerate.
+        factor = rng.choice([3.0, 0.1])
+        new_scales[slot] = new_scales[slot] * factor
+        return SceneTensor(
+            object_types=scene.object_types.clone(),
+            poses=scene.poses.clone(),
+            scales=new_scales,
+            presence=scene.presence.clone(),
+        )
 
-    # APPROX: workspace bounds proxy check.
-    # Physical workspace: x in [x_min, x_max], y, z similarly.
-    # denormalize/normalize round-trip: check normalised xyz is outside [-1, 1].
-    normalised = corrupted.normalize(bounds)
-    norm_xyz = normalised.poses[slot, :3]
-    if norm_xyz.abs().max().item() <= 1.0:
-        # Shift stayed within workspace -- discard this pair.
-        return None
-
-    return corrupted
+    else:  # object_removal: keep only one object (degenerate for multi-object tasks)
+        if len(present_slots) < 2:
+            return None  # single-object scene -- no meaningful removal
+        keep_slot = rng.choice(present_slots)
+        new_presence = torch.zeros_like(scene.presence)
+        new_presence[keep_slot] = True
+        return SceneTensor(
+            object_types=scene.object_types.clone(),
+            poses=scene.poses.clone(),
+            scales=scene.scales.clone(),
+            presence=new_presence,
+        )
 
 
 def _tensor_to_bytes(t: torch.Tensor) -> bytes:
@@ -148,6 +189,10 @@ def main() -> None:
                    help="Max valid scenes to process (produces up to 2x this many labeled samples)")
     p.add_argument("--shard-size", type=int, default=5000,
                    help="Samples per output shard")
+    p.add_argument("--perturbation-magnitude", type=float, default=_PERTURB_M,
+                   help="XYZ shift magnitude in metres for xyz_shift corruption (default 0.3)")
+    p.add_argument("--multiple-corruption-types", action="store_true",
+                   help="Use xyz_shift, scale_extreme, and object_removal corruptions (default: xyz_shift only)")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -163,6 +208,7 @@ def main() -> None:
 
     print(f"Generating classifier data: {args.data_dir} -> {args.out_dir}")
     print(f"Max scenes: {args.max_scenes} | Shard size: {args.shard_size} | Seed: {args.seed}")
+    print(f"Perturbation: {args.perturbation_magnitude}m | Multi-type: {args.multiple_corruption_types}")
 
     shard_idx = 0
     current_shard_path = out_dir / f"cls-{shard_idx:05d}.tar"
@@ -201,7 +247,11 @@ def main() -> None:
         shard_count += 1
 
         # --- Corrupted (invalid) sample ---
-        corrupted = _corrupt_scene(scene, bounds, rng_py)
+        corrupted = _corrupt_scene(
+            scene, bounds, rng_py,
+            perturb_m=args.perturbation_magnitude,
+            multi_type=args.multiple_corruption_types,
+        )
         if corrupted is None:
             n_discarded += 1
         else:
@@ -244,7 +294,8 @@ def main() -> None:
         "n_discarded": n_discarded,
         "total_samples": total_samples,
         "n_shards": shard_idx + 1,
-        "perturbation_m": _PERTURB_M,
+        "perturbation_m": args.perturbation_magnitude,
+        "multiple_corruption_types": args.multiple_corruption_types,
         "approx_note": (
             "APPROX: corrupted-scene invalidity checked via workspace bounds proxy only. "
             "Full Drake RRT validation skipped to avoid ~14 CPU-hours on 50k scenes. "

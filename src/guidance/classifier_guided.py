@@ -40,7 +40,7 @@ class ClassifierGuidedSampler:
     """DDIM sampler with classifier gradient guidance.
 
     Args:
-        model: Trained SceneDenoiser (conditional_v4).
+        model: Trained SceneDenoiser (conditional_v6 or later).
         classifier: Trained ValidityClassifier on noisy scenes.
         schedule: Cosine diffusion schedule.
         text_encoder: Frozen sentence-transformer.
@@ -50,6 +50,7 @@ class ClassifierGuidedSampler:
         grad_clip_norm: Per-step gradient norm clip value. Default 1.0.
         ddim_steps: DDIM inference steps. Default 50.
         batch_size: Scenes per generation batch.
+        type_init: Initial type_ids strategy for sample_with_types. Default 'uniform'.
         device: Torch device.
         seed: Base RNG seed.
     """
@@ -66,6 +67,7 @@ class ClassifierGuidedSampler:
         grad_clip_norm: float = 1.0,
         ddim_steps: int = 50,
         batch_size: int = 16,
+        type_init: str = "uniform",
         device: torch.device | None = None,
         seed: int = 0,
     ) -> None:
@@ -81,6 +83,7 @@ class ClassifierGuidedSampler:
         self._grad_clip_norm = grad_clip_norm
         self._ddim_steps = ddim_steps
         self._batch_size = batch_size
+        self._type_init = type_init
         self._device = device or torch.device("cpu")
         self._seed = seed
 
@@ -137,10 +140,10 @@ class ClassifierGuidedSampler:
         self,
         text_emb: Tensor,
     ):
-        """Return a guided noise prediction function for use with DDIMSampler.
+        """Return a guided noise prediction function for use with DDIMSampler.sample_with_types.
 
-        The returned function wraps the denoiser's noise prediction with
-        classifier gradient injection at each step.
+        The returned function has signature (x_t, type_ids, t_idx) -> (eps_guided, type_logits),
+        compatible with sample_with_types. Classifier gradient is injected into eps at each step.
 
         Guidance equation (Dhariwal & Nichol 2021, eq 12):
             eps_guided = eps_pred - w * sqrt(1 - alpha_bar_t) * grad_x log p(valid | x_t)
@@ -149,7 +152,7 @@ class ClassifierGuidedSampler:
             text_emb: Text embedding (1, D_TEXT).
 
         Returns:
-            Callable (x_t, t_idx, _) -> eps_guided, shape (B, N_MAX, 13).
+            Callable (x_t, type_ids, t_idx) -> (eps_guided, type_logits).
         """
         model = self._model
         classifier = self._classifier
@@ -158,66 +161,65 @@ class ClassifierGuidedSampler:
         clip_norm = self._grad_clip_norm
         mode = self._mode
 
-        def _fn(x_t: Tensor, t_idx: Tensor, _: Any) -> Tensor:
+        def _fn(x_t: Tensor, type_ids: Tensor, t_idx: Tensor):
             B = x_t.shape[0]
             expanded_text = text_emb.expand(B, -1)
 
             # --- Denoiser noise prediction (no grad needed here) ---
             with torch.no_grad():
-                type_ids = torch.zeros(B, N_MAX, dtype=torch.long, device=x_t.device)
                 denoiser_out = model(x_t, type_ids, t_idx, expanded_text)
                 eps_pred = torch.cat(
                     [denoiser_out.xyz, denoiser_out.rot6d, denoiser_out.scale,
                      denoiser_out.presence_logit], dim=-1
                 )  # (B, N_MAX, 13)
+                type_logits = denoiser_out.type_logits  # (B, N_MAX, N_TYPE)
 
             if w == 0.0:
-                return eps_pred
+                return eps_pred, type_logits
 
             # --- Classifier gradient ---
-            # Use enable_grad explicitly: this fn may be called inside a no_grad block
-            # during DDIM sampling. The classifier gradient requires autograd.
             with torch.enable_grad():
                 x_t_grad = x_t.detach().requires_grad_(True)
-                type_ids_g = torch.zeros(B, N_MAX, dtype=torch.long, device=x_t.device)
-
-                log_p = classifier.log_prob_valid(x_t_grad, type_ids_g, t_idx)  # (B,)
-                log_p_sum = log_p.sum()
-                log_p_sum.backward()
+                log_p = classifier.log_prob_valid(x_t_grad, type_ids, t_idx)  # (B,)
+                log_p.sum().backward()
 
             # grad has shape (B, N_MAX, 13).
             grad = x_t_grad.grad.detach()  # type: ignore[union-attr]
 
-            # Clip per-step gradient norm (across all dims per sample).
+            # Clip per-step gradient norm.
             grad_norm = grad.norm(dim=(-2, -1), keepdim=True)  # (B, 1, 1)
             scale_factor = (clip_norm / (grad_norm + 1e-8)).clamp(max=1.0)
             grad = grad * scale_factor
 
             # Apply guidance only to continuous dims if mode='continuous'.
             if mode == "continuous":
-                # Dims 0:12 = xyz(3) + rot6d(6) + scale(3). Dim 12 = presence.
                 grad_mask = torch.zeros_like(grad)
                 grad_mask[:, :, :12] = grad[:, :, :12]
                 grad = grad_mask
 
-            # sqrt(1 - alpha_bar_t): scalar per batch element.
             alpha_bar = schedule.alpha_bar(t_idx).to(x_t.device)      # (B,)
             sqrt_one_minus = (1.0 - alpha_bar).sqrt().view(B, 1, 1)   # (B, 1, 1)
 
             eps_guided = eps_pred - w * sqrt_one_minus * grad
-            return eps_guided
+            return eps_guided, type_logits
 
         return _fn
 
     def _sample_one(self, prompt: str) -> SceneTensor:
-        """Sample a single scene with guidance."""
+        """Sample a single scene with guidance using sample_with_types."""
         with torch.no_grad():
             text_emb = self._text_encoder.encode([prompt]).to(self._device)  # (1, D_TEXT)
 
         guided_fn = self._guided_noise_fn(text_emb)
 
-        x0 = self._base_sampler.sample(
-            guided_fn, (1, N_MAX, 13), seed=self._seed, device=self._device
+        # Use sample_with_types for v6: type_ids are updated at each DDIM step
+        # from the denoiser's own type logits, maintaining in-distribution context.
+        x0, _type_ids = self._base_sampler.sample_with_types(
+            guided_fn,
+            shape=(1, N_MAX, 13),
+            seed=self._seed,
+            device=self._device,
+            type_init=self._type_init,
         )
         self._seed += 1
 
@@ -229,7 +231,8 @@ class ClassifierGuidedSampler:
         pres_mask = pres_bit > 0.0
         quats = rot6d_to_quat_wxyz(rot6d_pred)
         poses_raw = torch.cat([xyz, quats], dim=-1)
-        types = torch.zeros(N_MAX, dtype=torch.long)
+        # Use predicted type_ids from sample_with_types.
+        types = _type_ids[0].cpu()
 
         st_norm = SceneTensor(
             object_types=types,

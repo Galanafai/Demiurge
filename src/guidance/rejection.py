@@ -45,6 +45,7 @@ class RejectionSampler:
         ddim_steps: int = 50,
         rrt_budget_s: float = 2.0,
         batch_size: int = 16,
+        type_init: str = "uniform",
         device: torch.device | None = None,
         seed: int = 0,
     ) -> None:
@@ -54,6 +55,7 @@ class RejectionSampler:
         self._bounds = bounds
         self._ddim_steps = ddim_steps
         self._batch_size = batch_size
+        self._type_init = type_init
         self._device = device or torch.device("cpu")
         self._seed = seed
         self._validator = SceneValidator(rrt_budget_s=rrt_budget_s)
@@ -120,7 +122,8 @@ class RejectionSampler:
         max_attempts: int,
     ) -> list[SceneTensor]:
         text_emb = self._encode_prompt(prompt)  # (1, D_TEXT)
-        fn = self._model.noise_prediction_fn(text_emb.expand(self._batch_size, -1))
+        # Use conditional_sampling_fn for v6: returns (eps, type_logits) at each step.
+        fn = self._model.conditional_sampling_fn(text_emb)
 
         accepted: list[SceneTensor] = []
         total_attempted = 0
@@ -132,12 +135,13 @@ class RejectionSampler:
             b = max(1, b)
 
             with torch.no_grad():
-                # Rebuild fn with correct batch size if b differs from batch_size.
-                if b != self._batch_size:
-                    fn_b = self._model.noise_prediction_fn(text_emb.expand(b, -1))
-                else:
-                    fn_b = fn
-                x0 = self._sampler.sample(fn_b, (b, N_MAX, 13), seed=rng_seed, device=self._device)
+                x0, type_ids_out = self._sampler.sample_with_types(
+                    fn,
+                    shape=(b, N_MAX, 13),
+                    seed=rng_seed,
+                    device=self._device,
+                    type_init=self._type_init,
+                )
 
             rng_seed += 1
             total_attempted += b
@@ -153,7 +157,8 @@ class RejectionSampler:
                 pres_mask = pres_bit[i] > 0.0
                 quats = rot6d_to_quat_wxyz(rot6d_pred[i])
                 poses_raw = torch.cat([xyz[i], quats], dim=-1)
-                types = torch.zeros(N_MAX, dtype=torch.long)
+                # Use predicted type_ids from sample_with_types.
+                types = type_ids_out[i].cpu()
                 st_norm = SceneTensor(
                     object_types=types,
                     poses=poses_raw.cpu(),
