@@ -159,6 +159,86 @@ class CosineSchedule:
 
         return (x_t - sqrt_1mab * eps_pred) / sqrt_ab.clamp(min=1e-8)
 
+    def type_corruption_prob(self, t_idx: Tensor) -> Tensor:
+        """Corruption probability for discrete type diffusion.
+
+        gamma_t = 1 - sqrt(alpha_bar_t).
+
+        At t=0, gamma=0 (no corruption -- clean type_ids preserved).
+        At t=T-1, gamma approx 1 (almost fully random types).
+        This mirrors the signal-to-noise schedule of the continuous process,
+        ensuring the denoiser sees consistent noise levels across modalities.
+
+        Args:
+            t_idx: Integer timestep indices in [0, T-1]. Shape: (B,).
+
+        Returns:
+            gamma: Float tensor of corruption probabilities. Shape: (B,).
+        """
+        ab = self.alpha_bar(t_idx)
+        return 1.0 - ab.sqrt()
+
+
+
+# ---------------------------------------------------------------------------
+# Discrete type diffusion
+# ---------------------------------------------------------------------------
+
+
+def corrupt_type_ids(
+    type_ids: Tensor,
+    t_idx: Tensor,
+    schedule: CosineSchedule,
+    n_valid_types: int = 12,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Uniform-corruption discrete diffusion for object type IDs.
+
+    Each present slot is independently replaced with a uniformly random valid
+    type with probability gamma_t = 1 - sqrt(alpha_bar_t). PAD slots
+    (type_id == n_valid_types) are never corrupted so the model cannot learn
+    to predict PAD from noise.
+
+    The corruption schedule is tied to the continuous alpha_bar schedule so
+    that at t=0 the types are clean (gamma=0) and at t=T-1 they are almost
+    fully random (gamma~=1). This ensures that during DDIM inference with
+    sample_with_types(), the type context seen at each reverse step matches
+    the distribution the model was trained on.
+
+    Args:
+        type_ids: Ground-truth integer type IDs. Shape: (B, N). Long tensor.
+        t_idx: Integer timestep indices in [0, T-1]. Shape: (B,).
+        schedule: The CosineSchedule instance used for training.
+        n_valid_types: Number of valid (non-PAD) object types. Default 12.
+            Types in [0, n_valid_types) are valid; type == n_valid_types is PAD.
+        generator: Optional RNG generator for reproducibility.
+
+    Returns:
+        Corrupted type IDs of the same shape and dtype as type_ids.
+        PAD slots retain their original value. Present slots are corrupted
+        with probability gamma_t.
+    """
+    B, N = type_ids.shape
+    device = type_ids.device
+
+    # gamma shape: (B,) -- one corruption probability per sample in the batch.
+    gamma = schedule.type_corruption_prob(t_idx).to(device)  # (B,)
+    gamma_expanded = gamma.unsqueeze(1).expand(B, N)           # (B, N)
+
+    # Bernoulli mask: True where we replace with a random type.
+    corrupt_mask = torch.bernoulli(gamma_expanded, generator=generator).bool()
+
+    # Draw replacement types uniformly from [0, n_valid_types).
+    random_types = torch.randint(
+        0, n_valid_types, (B, N), device=device, generator=generator
+    )
+
+    # Never corrupt PAD slots -- they carry structural (mask) information.
+    is_pad = type_ids >= n_valid_types
+    corrupt_mask = corrupt_mask & ~is_pad
+
+    return torch.where(corrupt_mask, random_types, type_ids)
+
 
 # ---------------------------------------------------------------------------
 # DDIM Sampler
@@ -285,10 +365,10 @@ class DDIMSampler:
     @torch.no_grad()
     def sample_with_types(
         self,
-        fn: "Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]]",
+        fn: Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]],
         shape: tuple[int, ...],
         seed: int | None = None,
-        device: "torch.device | str" = "cpu",
+        device: torch.device | str = "cpu",
         type_init: str = "uniform",
         n_valid_types: int = 12,
     ) -> tuple[Tensor, Tensor]:

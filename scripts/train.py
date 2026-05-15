@@ -27,7 +27,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 from model.denoiser import DenoiserConfig, SceneDenoiser  # noqa: E402
 from model.loss import LossWeights, SceneDiffusionLoss  # noqa: E402
 from model.rotations import quat_wxyz_to_6d  # noqa: E402
-from model.schedule import CosineSchedule, DDIMSampler  # noqa: E402
+from model.schedule import CosineSchedule, DDIMSampler, corrupt_type_ids  # noqa: E402
 from scene.schema import N_MAX, WorkspaceBounds  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -409,6 +409,12 @@ def main() -> None:
     # Warm init: load model_state from a pre-trained checkpoint before training.
     # Cross-attention layers stay randomly initialized; all shared layers warm-start.
     warm_init_from: str | None = tcfg.get("warm_init_from", None)
+    # Discrete type diffusion: if True, corrupt type_ids during training with
+    # probability gamma_t = 1 - sqrt(alpha_bar_t). Closes the train/inference
+    # mismatch that causes 0% Drake validity when using sample_with_types().
+    use_discrete_type_diffusion: bool = bool(
+        tcfg.get("use_discrete_type_diffusion", False)
+    )
 
     # --- Loss ---
     lcfg = cfg.get("loss", {})
@@ -712,7 +718,17 @@ def main() -> None:
             amp_ctx = torch.amp.autocast(device_type=device.type, dtype=amp_dtype) if use_amp else contextlib.nullcontext()
 
             with amp_ctx:
-                pred = model(x_noisy, type_ids, t_idx, text_emb_b)
+                # Apply discrete type corruption if enabled. The loss targets
+                # remain clean type_ids -- the model learns to predict clean
+                # types from a corrupted type context at each noise level.
+                if use_discrete_type_diffusion:
+                    type_ids_input = corrupt_type_ids(
+                        type_ids, t_idx, schedule, n_valid_types=12
+                    )
+                else:
+                    type_ids_input = type_ids
+
+                pred = model(x_noisy, type_ids_input, t_idx, text_emb_b)
                 loss_out = loss_fn(
                     pred,
                     eps_xyz, eps_rot, eps_scale, eps_pres,
