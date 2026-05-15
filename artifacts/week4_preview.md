@@ -7,6 +7,34 @@
 - Unconditional baseline: `unconditional_v3`, 5.4% validity
 - Conditional baseline: `conditional_v2` / `conditional_v3`, 17.0-17.4% EMA validity
 - 3.1-3.2x improvement over unconditional baseline confirmed via 500-scene Drake probe
+- VLM prompt-following: 1.09/5 mean -- driven by object type collapse (all type_id=0)
+- Joint Drake-valid + VLM>=4: ~0% outside cluttered_pick template
+
+---
+
+## CRITICAL FINDING: Object Type Collapse
+
+Week 3 Task 9 VLM evaluation exposed a fundamental model limitation: the model collapses
+to generating only `type_id=0` (generic cube) objects in ~99% of samples. Task descriptions
+reference specific named objects (mug, cracker_box, mustard_bottle, soup_can). The VLM
+judge correctly assigns score 1 to these mismatches.
+
+**Evidence:**
+- 2,839 of 3,054 scored samples (93%) received VLM score 1
+- The 26 score-4 samples are exclusively `cluttered_pick` prompts using generic "cube" references
+- `type_ce` loss converged near-zero (trivially by always predicting majority class)
+- Confirmed via Sonnet cross-validation (290 disagreement cases re-judged)
+
+**Root cause:** Training data imbalance toward type_id=0 combined with low `type_ce` weight
+(0.1). Standard majority-class collapse in imbalanced multi-class classification.
+
+**Impact:** Drake geometric validity (17% unconditional, 9.8% text-conditioned) remains
+meaningful. Text conditioning works on spatial relationships. Object identity is not conditioned.
+Joint metric is blocked until this is fixed.
+
+**This is Week 4 priority 0** -- it must be resolved before classifier guidance numbers
+are meaningful, since a model that always generates cubes cannot be fairly evaluated on
+type-diverse prompts.
 
 ---
 
@@ -38,9 +66,26 @@ at this scene complexity. Scaling to d_model=512 is not the next lever; better g
 
 ---
 
-## Week 4 Objectives
+## Week 4 Objectives (Priority Order)
 
-### Primary: Classifier guidance for reachability
+### Priority 0: Fix object type collapse (NEW -- blocks meaningful VLM metric)
+
+**Problem:** 93% of generated scenes contain only `type_id=0` (cube). `joint Drake+VLM>=4`
+rate is ~0% as a result. The VLM evaluation harness works correctly; the model does not.
+
+**Fix options (in order of preference):**
+1. **Class-balanced sampling:** During each batch, ensure all 6 object types are represented
+   proportionally. Weighted sampler on the dataset keyed by object type distribution per scene.
+2. **Weighted cross-entropy:** Explicit inverse-frequency class weights in `type_ce` loss.
+   Estimated weights: cube ~0.05, others ~1.0 (roughly 20x upweight on rare types).
+3. **Increase `type_ce` loss weight:** From 0.1 to 1.0. May require LR adjustment.
+4. **Fine-tune only:** Load `conditional_v2` checkpoint, freeze denoiser layers, fine-tune
+   only the type head with balanced batches for 10k steps.
+
+**Success criterion:** VLM mean score > 2.5 on `tabletop_reach` and `cluttered_pick`
+templates. `joint Drake+VLM>=4` rate > 5%.
+
+### Priority 1: Classifier guidance for reachability
 
 **Motivation:** Dominant rejection mode in v3 is RRT failure (54%) followed by IK
 unreachability (22%). Together, 76% of rejections are robot-reachability failures. The model
@@ -51,29 +96,29 @@ did the scene pass all four Drake checks?). Use its gradient (or logit) as a gui
 during DDIM sampling.
 
 **Implementation options:**
-- Gradient-based classifier guidance (Dhariwal and Nichol 2021): `x_t <- x_t + s * grad_x log p(valid | x_t)`. Requires the classifier to be differentiable with respect to the noisy scene input.
-- Logit-based rejection sampling: run classifier at inference time, filter scenes below a
-  validity threshold before Drake validation. Simpler, no gradient needed.
+- Gradient-based classifier guidance (Dhariwal and Nichol 2021): `x_t <- x_t + s * grad_x log p(valid | x_t)`. Requires differentiability w.r.t. noisy scene input.
+- Logit-based rejection sampling: run classifier at inference, filter below threshold. Simpler.
 
-**Baseline comparison:** Compare guided sampling validity rate vs. unguided conditional
-sampling at the same number of DDIM steps. Success criterion: >25% validity with guidance
-vs. 17.4% without.
+**Baseline comparison:** guided vs. unguided validity rate. Success criterion: >25% with
+guidance vs. 17.4% without.
 
-### Secondary: Evaluation harness (Week 3.5 deferred)
+### Priority 2: Decoupled validation architecture
 
-Per the six-layer architecture, Layer 6 (evaluation) was deferred. Week 4 should produce:
-- `src/eval/validity_rate.py` -- 500-scene Drake probe, wraps the probe script into a library
+Remove inline `run_validation()` from training loop entirely. 57% of Week 3 wall-clock was
+GPU-idle Drake work. Week 4 trains faster with milestone-based 500-scene probes.
+
+### Priority 3: Evaluation harness (Layer 6)
+
+- `src/eval/validity_rate.py` -- wraps probe into a library callable
 - `src/eval/diversity.py` -- mean pairwise distance in scene space
-- `src/eval/task_relevance.py` -- embedding similarity between generated scene description
-  and target text prompt
+- `src/eval/task_relevance.py` -- embedding similarity between scene and prompt
 - `src/eval/rrt_success.py` -- downstream RRT success rate on accepted scenes
 
-### Stretch: Larger model variant
+### Priority 4: Larger model variant (stretch)
 
-If classifier guidance does not break the validity plateau:
+Only if priorities 0-2 do not break the plateau:
 - Scale to d_model=512 (32M params, 4x current)
-- Requires new training run; ~6h with fixed validation architecture
-- Keep d_model=256 as the comparison baseline
+- Keep d_model=256 as comparison baseline
 
 ---
 
@@ -96,12 +141,15 @@ Classifier head: separate script, separate checkpoint. Does not modify the denoi
 
 ## Week 4 Build Order
 
-1. Dataset labeling: add Drake validity label to each scene in the 50k dataset
-2. Classifier training: small MLP on top of frozen scene features
-3. Guidance integration: plug classifier gradient into `DDIMSampler.sample()`
-4. Evaluation harness: `src/eval/` modules
-5. Final ablation: guided vs. unguided validity rates, diversity, task relevance
-6. Ship Week 4 with classifier guidance + evaluation numbers
+1. **Type collapse fix:** weighted cross-entropy + class-balanced sampler, 10k fine-tune steps
+2. **VLM re-evaluation:** run Task 9 harness on fixed model; confirm mean VLM > 2.5
+3. **Decoupled validation:** remove inline Drake from training loop, milestone probe script
+4. **Dataset labeling:** add Drake validity label to each scene in the 50k dataset
+5. **Classifier training:** small MLP/transformer on noisy scenes, AUC > 0.85 target
+6. **Guidance integration:** plug classifier gradient into `DDIMSampler.sample()`
+7. **Evaluation harness:** `src/eval/` modules (validity_rate, diversity, task_relevance, rrt_success)
+8. **Ablation + Pareto sweep:** guided vs. unguided, guidance scale 0-16
+9. Ship Week 4 with all results including honest comparison to rejection sampling
 
 ---
 

@@ -104,11 +104,59 @@ reachability is the highest-value Week 4 improvement.
 
 ---
 
+## CRITICAL FINDING: Object Type Collapse
+
+Task 9 VLM evaluation revealed that the model collapses to `type_id=0` (generic cube) in
+~99% of generated scenes, despite the dataset containing 6 distinct object types.
+
+### Evidence
+
+| Signal | Value |
+|---|---|
+| VLM mean score (Haiku 4.5, 3,054 samples) | 1.09/5 |
+| Score distribution | 93% score 1, 6% score 2, 1% score 4 |
+| Score-4 samples origin | 100% from `cluttered_pick` (generic cube prompts) |
+| Joint Drake-valid + VLM>=4 | ~0% |
+| `type_ce` loss at convergence | near-zero (majority-class collapse) |
+
+### Root Cause
+
+Training data imbalance toward `type_id=0` combined with `type_ce` loss weight of 0.1.
+The model minimizes total loss by always predicting type_id=0 (majority class) and concentrating
+capacity on pose and presence prediction. Standard imbalanced classification failure mode.
+
+### Interpretation
+
+Drake geometric validity numbers remain fully meaningful -- they measure spatial coherence,
+not object identity. Text conditioning works on spatial relationships (positions, orientations,
+object counts) as evidenced by the 9.8% conditioned validity rate (vs. 5.4% unconditional).
+Object identity conditioning is simply not implemented.
+
+This is not a flaw in the evaluation methodology. The VLM harness correctly identified a
+real model limitation that was invisible to the Drake validity metric alone. The two evaluation
+axes (geometric validity, semantic alignment) are complementary, not redundant.
+
+### Week 4 Remediation
+
+1. Class-balanced sampling: weight dataset sampler by object type distribution per scene
+2. Weighted cross-entropy: inverse-frequency class weights (~20x upweight on non-cube types)
+3. Increase `type_ce` weight from 0.1 to 1.0
+
+Success criterion: VLM mean score >2.5 on `tabletop_reach` and `cluttered_pick`. Joint
+Drake+VLM>=4 rate >5%.
+
+---
+
 ## Artifacts
 
 - `checkpoints/conditional_v2/latest.pt` -- v2 ship checkpoint (100k steps)
 - `checkpoints/conditional_v3/latest.pt` -- v3 final checkpoint (115k steps)
 - `artifacts/conditional_v3_final_probe.json` -- raw probe results (both heads)
+- `artifacts/conditional_vlm_eval.md` -- Task 9 VLM evaluation report (type collapse finding)
+- `artifacts/week3_vlm_eval/haiku_scores.summary.json` -- Haiku bulk judge summary
+- `artifacts/week3_vlm_eval/sonnet_cross_val.summary.json` -- Sonnet CV summary
+- `artifacts/week3_vlm_eval/sonnet_disagreement.summary.json` -- 290-case Sonnet re-judge
 - `logs/v3_final_probe.log` -- full probe stdout
 - `configs/train/conditional_v3.yaml` -- v3 training config
 - W&B project: `galanafai-self/demiurge`, runs `iqfebjel` (v2), `wvdoaybk` (v3)
+- Total VLM API cost: $3.47 (Haiku $2.68 + Sonnet CV $0.13 + Sonnet disagreement $0.67)
