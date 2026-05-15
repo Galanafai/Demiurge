@@ -1,138 +1,113 @@
-# Week 4 Preview
+# Week 4 Preview: Classifier Guidance and Evaluation
 
-## Starting Point
+**Status:** Planning. Week 3 shipped `conditional_v3` (EMA 17.4% [14.1, 20.7]%) and
+`conditional_v2` (EMA 17.0% [13.7, 20.3]%) as the established conditional baseline.
 
-- **Best unconditional baseline:** unconditional_v3 (presence_bce=1.0, validity 5.4%, mean count 4.66)
-- **Conditional result:** conditional_v1 CASE 3 (text-conditioned validity 1.0%, root cause: no CFG)
-- **Architecture:** d_model=256, 8.89M params -- confirmed adequate for unconditional, insufficient
-  training procedure for conditional
-- **DataLoader:** num_workers=2 validated and ready
+**Week 3 final state:**
+- Unconditional baseline: `unconditional_v3`, 5.4% validity
+- Conditional baseline: `conditional_v2` / `conditional_v3`, 17.0-17.4% EMA validity
+- 3.1-3.2x improvement over unconditional baseline confirmed via 500-scene Drake probe
 
 ---
 
-## Primary Goal: conditional_v2 with CFG
+## Week 3 Lessons Applied to Week 4
 
-The single highest-leverage change is classifier-free guidance (CFG) training.
+### 1. Drake validation is not an inline training metric
 
-### Implementation Plan
+The biggest practical finding of Week 3: synchronous Drake validation inside the training
+loop consumed 57% of wall-clock time (GPU idle at 0%, CPU-bound BiRRT at 2s/scene).
 
-**1. Add CFG dropout to `scripts/train.py`:**
+**Week 4 validation architecture:**
+- Remove inline `run_validation()` calls from the training loop entirely
+- Track loss as the training-time proxy for model quality
+- Run 500-scene Drake probes as explicit evaluation milestones (not during training)
+- If intermediate checkpoints need validity estimates: use a fast headless check
+  (interpenetration + stable_rest only, skip IK/RRT) as a cheap proxy
 
-```python
-# Read from config
-cfg_dropout = float(cfg.get("cfg_dropout", 0.0))
+### 2. CFG dropout is load-bearing
 
-# In training loop, after loading text_emb_b:
-if text_emb_b is not None and cfg_dropout > 0.0:
-    drop_mask = torch.rand(text_emb_b.shape[0]) < cfg_dropout
-    if drop_mask.any():
-        text_emb_b = text_emb_b.clone()
-        text_emb_b[drop_mask] = 0.0  # zero-embedding for dropped samples
-```
+CFG dropout at 15% was the single fix that took conditional validity from 1.0% to 17%.
+Week 4 must preserve CFG dropout in all classifier-guided variants. The guidance multiplier
+is applied at inference time; training always uses 15% null conditioning.
 
-**2. Add CFG scale to `model/schedule.py` DDIMSampler:**
+### 3. Architecture capacity is not the bottleneck at step 100k
 
-```python
-def sample_cfg(fn_cond, fn_uncond, shape, w=3.0, ...):
-    # pred = uncond + w * (cond - uncond)
-```
+v3 at 115k steps is statistically tied with v2 at 100k steps. Loss plateau at 1.20-1.24 from
+epoch 50 onward. The model is not underfit -- 8.89M parameters is sufficient for 50k scenes
+at this scene complexity. Scaling to d_model=512 is not the next lever; better guidance is.
 
-**3. `configs/train/conditional_cfg.yaml`:**
+---
 
+## Week 4 Objectives
+
+### Primary: Classifier guidance for reachability
+
+**Motivation:** Dominant rejection mode in v3 is RRT failure (54%) followed by IK
+unreachability (22%). Together, 76% of rejections are robot-reachability failures. The model
+generates physically plausible scenes but does not know what the UR5e can reach.
+
+**Approach:** Train a lightweight Drake-validity classifier on the 50k dataset (binary label:
+did the scene pass all four Drake checks?). Use its gradient (or logit) as a guidance signal
+during DDIM sampling.
+
+**Implementation options:**
+- Gradient-based classifier guidance (Dhariwal and Nichol 2021): `x_t <- x_t + s * grad_x log p(valid | x_t)`. Requires the classifier to be differentiable with respect to the noisy scene input.
+- Logit-based rejection sampling: run classifier at inference time, filter scenes below a
+  validity threshold before Drake validation. Simpler, no gradient needed.
+
+**Baseline comparison:** Compare guided sampling validity rate vs. unguided conditional
+sampling at the same number of DDIM steps. Success criterion: >25% validity with guidance
+vs. 17.4% without.
+
+### Secondary: Evaluation harness (Week 3.5 deferred)
+
+Per the six-layer architecture, Layer 6 (evaluation) was deferred. Week 4 should produce:
+- `src/eval/validity_rate.py` -- 500-scene Drake probe, wraps the probe script into a library
+- `src/eval/diversity.py` -- mean pairwise distance in scene space
+- `src/eval/task_relevance.py` -- embedding similarity between generated scene description
+  and target text prompt
+- `src/eval/rrt_success.py` -- downstream RRT success rate on accepted scenes
+
+### Stretch: Larger model variant
+
+If classifier guidance does not break the validity plateau:
+- Scale to d_model=512 (32M params, 4x current)
+- Requires new training run; ~6h with fixed validation architecture
+- Keep d_model=256 as the comparison baseline
+
+---
+
+## Week 4 Config Starting Point
+
+Baseline: `conditional_v3.yaml` with these changes:
 ```yaml
-text_conditioning: true
-cfg_dropout: 0.15       # 15% unconditional training passes
 training:
-  max_steps: 200000     # 2x v1 budget
-dataset:
-  num_workers: 2
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 2
-loss:
-  presence_bce: 1.0    # keep v3 Pareto optimum
+  max_steps: 100000         # guidance training is fast
+  val_every_epochs: 999999  # disable inline validation
+  val_n_scenes: 0           # disabled
+  lr: 1.0e-4                # lower LR for fine-tuning on top of v3
+  warm_init_from: checkpoints/conditional_v3/latest.pt
+  warm_init_keys: model_state
 ```
 
-**4. Initialization:** Start from unconditional_v3 weights. The cross-attention layers
-initialize randomly; all other layers warm-start from v3's trained state. This gives
-the presence and pose heads a head start and focuses learning on the conditioning task.
-
-Expected improvement: With CFG training and warm initialization, text-conditioned
-validity should reach 5-15% within 100k steps.
+Classifier head: separate script, separate checkpoint. Does not modify the denoiser.
 
 ---
 
-## Secondary Goal: Evaluation Quality
+## Week 4 Build Order
 
-The VLM judge infrastructure (`src/eval/judge.py`) is implemented but not yet used.
-Once conditional_v2 achieves acceptable validity, run the VLM scorer on accepted scenes
-to measure task relevance (does "place the mug" produce a scene with a mug?).
-
-**Required:** `CLAUDE_API_KEY` env var on the pod.
-
----
-
-## Recommended Experiment Sequence
-
-### Week 4, Phase 1: conditional_v2 with CFG
-
-Config: `configs/train/conditional_cfg.yaml`
-Init: from `checkpoints/unconditional_v3/latest.pt` (cross-attention layers random)
-Steps: 200k
-Cost estimate: ~$0.90
-
-Mid-run check at step 50k:
-- Text-conditioned validity >= 3%: continue
-- Text-conditioned validity == 0%: halt, diagnose cross-attention initialization
-
-### Week 4, Phase 2: CFG scale sweep (if Phase 1 succeeds)
-
-Sample 200 scenes at CFG scales w = [1.0, 2.0, 3.0, 5.0].
-Report validity vs task relevance tradeoff.
-Expected: higher w = higher task relevance, lower validity (over-conditioning).
-
-### Week 4, Phase 3: VLM scoring (if Phase 2 succeeds)
-
-Take the best-validity conditional model. Sample 100 accepted scenes.
-Score each with `judge.py` using `claude-haiku-4-5` (bulk) and `claude-sonnet-4-6` (headline).
-Report: mean task relevance score, distribution by template, qualitative examples.
-
----
-
-## Deferred Work
-
-| Item | Deferred To | Reason |
-|---|---|---|
-| d_model=512 escalation | Week 5 if needed | v3 at d_model=256 has sufficient unconditional validity |
-| Rejection sampling guidance | Week 5 | Requires working conditional baseline first |
-| Full 500-scene text-conditioned probe | conditional_v2 | v1 used 200 scenes; v2 should use 500 |
-| Text description quality audit | Week 4 | Check if descriptions are sufficiently discriminative for presence learning |
+1. Dataset labeling: add Drake validity label to each scene in the 50k dataset
+2. Classifier training: small MLP on top of frozen scene features
+3. Guidance integration: plug classifier gradient into `DDIMSampler.sample()`
+4. Evaluation harness: `src/eval/` modules
+5. Final ablation: guided vs. unguided validity rates, diversity, task relevance
+6. Ship Week 4 with classifier guidance + evaluation numbers
 
 ---
 
 ## Open Questions
 
-1. **CFG dropout probability:** 0.15 is the standard. For this dataset with 17k unique
-   descriptions and ~3 objects per scene on average, 0.1 may be too low (model rarely
-   sees unconditional training). Try 0.15-0.20.
-
-2. **CFG scale at inference:** The right scale depends on the conditioning strength.
-   Start at w=3.0, measure validity vs diversity tradeoff.
-
-3. **Warm init strategy:** Load v3 weights, keep cross-attention random. The alternative
-   (full random init, longer training) is cleaner experimentally but more expensive.
-
-4. **Presence behavior with CFG:** With p=0.15 unconditional passes, the model should
-   learn that unconditioned presence is low (training data mean ~2.5). Will this fix
-   the 10.11 mean count seen in conditional_v1 unconditional probe?
-   Expected: yes, by ~50% reduction.
-
----
-
-## Infrastructure Changes Needed for Week 4
-
-1. Add `cfg_dropout` config key and training loop support in `scripts/train.py`
-2. Add `sample_cfg()` method to `DDIMSampler` for CFG inference
-3. Add `--init-from` argument to `train.py` for warm initialization
-4. Add `tests/model/test_cfg_sampling.py` unit test for CFG sampler
-5. Implement VLM scoring pipeline in `scripts/score_scenes.py`
+- Does the classifier need to be trained on noisy inputs (x_t) for gradient guidance, or can
+  it be trained on clean scenes (x_0) and used in an x_0-prediction guidance scheme?
+- What is the right guidance strength `s`? Too high drives samples out of the data manifold.
+- Does the guidance interact well with CFG? (Two guidance signals: text conditioning + validity)
