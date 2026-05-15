@@ -1,0 +1,106 @@
+# Training configuration: conditional_v4 -- Type Collapse Fix
+#
+# Phase A of Week 4. Fixes the majority-class collapse (type_id=0 ~99% of
+# generations) identified in Week 3 Task 9 VLM evaluation.
+#
+# Key differences from conditional_v2 (the Phase A warm-init source):
+#   - loss.type_ce: 1.0              (was 0.1 -- CRITICAL fix)
+#   - training.use_class_balanced_sampler: true   (object-type balanced)
+#   - training.class_weights: [...]  (inverse-frequency, from audit)
+#   - training.lr: 1e-4              (lower, warm-init from v2)
+#   - training.max_steps: 50000      (half v2, starting hot)
+#   - training.val_every_epochs: 999999  (disabled -- milestone probes only)
+#   - training.val_n_scenes: 0
+#   - training.warm_init_from: checkpoints/conditional_v2/latest.pt
+#
+# Resume behavior: if checkpoints/conditional_v4/latest.pt exists, the
+# training loop resumes from that checkpoint and ignores warm_init_from.
+# This is the correct behavior -- warm_init_from is only used for fresh starts.
+#
+# Usage (on pod):
+#   tmux new-session -d -s cond_v4 \
+#     "cd /workspace/Demiurge && PYTHONUNBUFFERED=1 \
+#      PYTHONPATH=/workspace/Demiurge/src python3 -u \
+#      scripts/train.py --config configs/train/conditional_v4.yaml \
+#      --seed 42 2>&1 | tee logs/cond_v4.log"
+
+text_conditioning: true
+
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  batch_size: 128
+  lr: 1.0e-4
+  warmup_steps: 500
+  max_steps: 50000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000
+  # Inline Drake validation disabled. Run scripts/probe_drake.py at milestones.
+  val_every_epochs: 999999
+  val_n_scenes: 0
+  dtype: "float32"
+  # Class-balanced sampler replaces template-balanced sampler.
+  # Weights each training example by mean(1/freq) over its present object types.
+  use_class_balanced_sampler: true
+  # weighted_sampling is overridden by use_class_balanced_sampler when true.
+  weighted_sampling: false
+  # IMPORTANT: replace placeholder values with output of compute_class_distribution.py
+  # before launching training. The placeholder assertion in train.py will reject
+  # values containing 0.0 or 1.0, so this config cannot be run without running
+  # the audit first.
+  #
+  # To generate: PYTHONPATH=src python3 scripts/compute_class_distribution.py \
+  #   --data-dir data/v1 --eps 0.01
+  class_weights: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+  cfg_dropout: 0.15
+
+  # Warm-init from conditional_v2 (step 100k, EMA 17.0% validity).
+  # Cross-attention layers that already exist in v2 carry over.
+  # If checkpoints/conditional_v4/latest.pt already exists, train.py
+  # resumes from that checkpoint instead (warm_init_from is ignored).
+  warm_init_from: checkpoints/conditional_v2/latest.pt
+  warm_init_keys: model_state
+
+  num_workers: 0
+  log_every_steps: 10
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  # CRITICAL: type_ce raised from 0.1 to 1.0. This is the primary fix.
+  # At 0.1, the model minimised total loss by always predicting type_id=0
+  # (majority class) while concentrating capacity on pose/presence/scale.
+  type_ce: 1.0
+  presence_bce: 1.0
+
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 2
+
+output:
+  dir: "checkpoints/conditional_v4"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v4"
+  tags: ["model", "week4", "conditional", "d256", "v4", "type-collapse-fix",
+         "class-balanced", "type-ce-1.0", "warm-v2"]

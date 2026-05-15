@@ -1,0 +1,33 @@
+# Classifier training config: classifier_v1
+#
+# Trains ValidityClassifier on data/classifier_v1/ noisy-scene shards.
+# One epoch, AUC >= 0.85 required (hard halt if below).
+#
+# Usage:
+#   PYTHONPATH=/workspace/Demiurge/src python3 scripts/train_classifier.py \
+#       --config configs/classifier/classifier_v1.yaml \
+#       --seed 42
+
+data:
+  shard_dir: "data/classifier_v1"
+  val_frac: 0.2
+
+model:
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+
+training:
+  batch_size: 256
+  lr: 3.0e-4
+  warmup_steps: 500
+  auc_threshold: 0.85
+
+output:
+  dir: "checkpoints/classifier_v1"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "classifier_v1"
+  tags: ["classifier", "week4", "phase-b", "validity", "noisy-input"]

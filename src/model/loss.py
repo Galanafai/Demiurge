@@ -81,11 +81,25 @@ class SceneDiffusionLoss(torch.nn.Module):
     Args:
         weights: LossWeights instance controlling per-component scaling.
             Defaults to LossWeights() if not provided.
+        class_weights: Optional 1-D float tensor of shape (N_TYPE,) providing
+            per-class weights for the type cross-entropy term. When provided,
+            passed as the ``weight`` argument to ``F.cross_entropy``.
+            Inverse-frequency weighting mitigates majority-class collapse.
+            Default None preserves existing uniform-weight behavior.
     """
 
-    def __init__(self, weights: LossWeights | None = None) -> None:
+    def __init__(
+        self,
+        weights: LossWeights | None = None,
+        class_weights: torch.Tensor | None = None,
+    ) -> None:
         super().__init__()
         self.weights = weights or LossWeights()
+        # Register as buffer so it moves with .to(device) automatically.
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights.float())
+        else:
+            self.class_weights: torch.Tensor | None = None
 
     def forward(
         self,
@@ -136,7 +150,10 @@ class SceneDiffusionLoss(torch.nn.Module):
         # Flatten to (B*N_MAX, N_TYPE) for F.cross_entropy, then mask.
         logits_flat = pred.type_logits.reshape(B * N_MAX_local, N_TYPE)
         ids_flat = target_type_ids.reshape(B * N_MAX_local)
-        ce_flat = F.cross_entropy(logits_flat, ids_flat, reduction="none")  # (B*N_MAX,)
+        # class_weights: inverse-frequency tensor (N_TYPE,) on same device as logits.
+        # None = uniform weights (original behavior).
+        cw = self.class_weights  # type: ignore[attr-defined]
+        ce_flat = F.cross_entropy(logits_flat, ids_flat, weight=cw, reduction="none")  # (B*N_MAX,)
         ce_2d = ce_flat.reshape(B, N_MAX_local)
         loss_type = (ce_2d * mask).sum() / n_present
 

@@ -346,6 +346,12 @@ def run_validation(
 
 
 def main() -> None:
+    # Fix DataLoader multiprocessing on PyTorch nightly + Blackwell (sm_120).
+    # The default 'file_descriptor' strategy deadlocks when num_workers > 0;
+    # 'file_system' avoids shared-memory fd limits and is stable on Linux.
+    import torch.multiprocessing as _mp
+    _mp.set_sharing_strategy('file_system')
+
     args = parse_args()
     cfg: dict[str, Any] = _load_yaml(args.config)
     _apply_overrides(cfg, args.override or [])
@@ -390,6 +396,12 @@ def main() -> None:
     mixed_prec = tcfg.get("dtype", "float32")
     use_amp = mixed_prec in ("float16", "bfloat16") and device.type == "cuda"
     amp_dtype = torch.bfloat16 if mixed_prec == "bfloat16" else torch.float16
+    # Cosine LR warm restart: at cosine_restart_step, jump LR to cosine_restart_lr
+    # then decay to 1% of that value by max_steps. Set to None to disable (v1/v2 behavior).
+    cosine_restart_step: int | None = tcfg.get("cosine_restart_step", None)
+    cosine_restart_lr: float = float(tcfg.get("cosine_restart_lr", 1e-4))
+    # W&B log throttle: only log every N steps to reduce Python overhead at high throughput.
+    log_every_steps: int = int(tcfg.get("log_every_steps", 1))
     # CFG dropout: probability of replacing text_emb with None per batch.
     # 0.0 = always conditional (conditional_v1 behavior -- caused collapse).
     # 0.15 = 15% unconditional passes, forces model to learn both paths.
@@ -407,7 +419,28 @@ def main() -> None:
         type_ce=float(lcfg.get("type_ce", 0.1)),
         presence_bce=float(lcfg.get("presence_bce", 0.05)),
     )
-    loss_fn = SceneDiffusionLoss(loss_weights)
+    # class_weights: inverse-frequency per-class weights for type cross-entropy.
+    # Read from training.class_weights as a list of floats in the YAML.
+    # Must have exactly N_TYPE entries and must not be all-ones or contain zeros
+    # (that would indicate a placeholder was left in the config).
+    _cw_raw: list[float] | None = tcfg.get("class_weights", None)
+    class_weights_tensor: torch.Tensor | None = None
+    if _cw_raw is not None:
+        from model.denoiser import N_TYPE as _N_TYPE
+        if len(_cw_raw) != _N_TYPE:
+            raise ValueError(
+                f"training.class_weights has {len(_cw_raw)} entries but N_TYPE={_N_TYPE}. "
+                "Run scripts/compute_class_distribution.py to generate the correct values."
+            )
+        # Assertion: reject placeholder weights (all-ones or any exact 0 or 1).
+        if any(w == 0.0 or w == 1.0 for w in _cw_raw):
+            raise ValueError(
+                f"training.class_weights appears to be a placeholder (contains 0.0 or 1.0): "
+                f"{_cw_raw}. Run scripts/compute_class_distribution.py first."
+            )
+        class_weights_tensor = torch.tensor(_cw_raw, dtype=torch.float32)
+        print(f"Class weights loaded: {[f'{w:.3f}' for w in _cw_raw]}")
+    loss_fn = SceneDiffusionLoss(loss_weights, class_weights=class_weights_tensor)
 
     # --- Dataset ---
     from data.reader import ShardReader
@@ -476,11 +509,17 @@ def main() -> None:
     print(f"Train: {len(train_indices)} | Held-out: {len(held_out_indices)}")
 
     # WeightedRandomSampler weights.
-    if weighted_sampling:
+    use_class_balanced = bool(tcfg.get("use_class_balanced_sampler", False))
+    if use_class_balanced:
+        from data.balanced_sampler import make_class_balanced_sampler
+        sampler = make_class_balanced_sampler(all_examples, train_indices, eps=0.01)
+        print(f"Using ClassBalancedSampler (type-frequency balanced, eps=0.01)")
+    elif weighted_sampling:
         train_families = [all_examples[i][2].get("task_family", "unknown") for i in train_indices]
         fam_counts = {f: train_families.count(f) for f in set(train_families)}
         weights = [1.0 / fam_counts[f] for f in train_families]
         sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(train_indices), replacement=True)
+        print(f"Using template-balanced WeightedRandomSampler")
     else:
         sampler = None  # type: ignore[assignment]
 
@@ -535,8 +574,18 @@ def main() -> None:
     def _lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
-        # Cosine decay to 10% of peak.
-        progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+        # Cosine warm restart: if configured, apply a second cosine segment
+        # from cosine_restart_step to max_steps, starting at cosine_restart_lr.
+        if cosine_restart_step is not None and step >= cosine_restart_step:
+            # Scale factor relative to base lr so LambdaLR multiplier is correct.
+            restart_scale = cosine_restart_lr / max(lr, 1e-12)
+            seg_progress = (step - cosine_restart_step) / max(1, max_steps - cosine_restart_step)
+            # Decay from restart_lr to 1% of restart_lr.
+            return restart_scale * (0.01 + 0.99 * (1.0 + math.cos(math.pi * seg_progress)) / 2.0)
+        # Primary cosine decay: lr -> 10% of peak over warmup_steps..cosine_restart_step (or max_steps).
+        decay_end = cosine_restart_step if cosine_restart_step is not None else max_steps
+        progress = (step - warmup_steps) / max(1, decay_end - warmup_steps)
+        progress = min(progress, 1.0)  # clamp: don't decay past restart point
         return 0.1 + 0.9 * (1.0 + math.cos(math.pi * progress)) / 2.0
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
@@ -697,7 +746,7 @@ def main() -> None:
 
                 epoch_loss += loss_out.total.item()
 
-                if wandb_run is not None:
+                if wandb_run is not None and step % log_every_steps == 0:
                     log_dict = {f"loss/{k}": v for k, v in loss_out.as_log_dict().items()}
                     log_dict["train/grad_norm"] = float(grad_norm)
                     log_dict["train/lr"] = lr_scheduler.get_last_lr()[0]
@@ -718,7 +767,7 @@ def main() -> None:
         epoch_elapsed = time.monotonic() - epoch_t0
 
         # Validation pass.
-        if (epoch + 1) % val_every == 0:
+        if (epoch + 1) % val_every == 0 and val_n > 0:
             vrate = run_validation(model, schedule, ddim_steps, val_n, bounds, device)
             print(f"  [epoch {epoch+1}] validity_rate={vrate:.3f}")
             if wandb_run is not None:
