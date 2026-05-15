@@ -249,6 +249,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", required=True)
     p.add_argument("--skip-vlm", action="store_true", help="Skip VLM scoring (Drake + type stats only)")
+    p.add_argument(
+        "--cfg-scale", type=float, default=1.0,
+        help="CFG guidance scale: 0.0=unconditional, 1.0=pure conditional (default). "
+             "Values between mix eps_uncond and eps_cond. Requires the model to have "
+             "been trained with cfg_dropout > 0 for monotone behavior.",
+    )
     return p.parse_args()
 
 
@@ -303,9 +309,23 @@ def main() -> None:
             continue
 
         seed = hash((args.seed, desc_id)) & 0xFFFFFFFF
-        sampling_fn = model.conditional_sampling_fn(
-            text_emb.expand(args.n_per_prompt, -1)
-        )
+        # Build sampling function with optional CFG interpolation.
+        # cfg_scale=1.0: pure conditional (original behavior)
+        # cfg_scale=0.0: pure unconditional
+        # 0 < cfg_scale < 1: interpolated (requires CFG-trained model)
+        cfg_scale = args.cfg_scale
+        text_emb_expanded = text_emb.expand(args.n_per_prompt, -1)
+        if cfg_scale == 1.0:
+            sampling_fn = model.conditional_sampling_fn(text_emb_expanded)
+        elif cfg_scale == 0.0:
+            sampling_fn = model.conditional_sampling_fn(text_emb=None)
+        else:
+            _uncond_fn = model.conditional_sampling_fn(text_emb=None)
+            _cond_fn = model.conditional_sampling_fn(text_emb_expanded)
+            def sampling_fn(x_t, type_ids_arg, t):
+                eps_u, logits_u = _uncond_fn(x_t, type_ids_arg, t)
+                eps_c, logits_c = _cond_fn(x_t, type_ids_arg, t)
+                return eps_u + cfg_scale * (eps_c - eps_u), logits_c
         with torch.no_grad():
             x_cont_batch, type_ids_batch = sampler.sample_with_types(
                 sampling_fn,

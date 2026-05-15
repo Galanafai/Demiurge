@@ -1,0 +1,105 @@
+# Training configuration: conditional_v7 -- CFG Null-Conditioning Dropout
+#
+# Week 4, Phase D. Fixes the V-shaped CFG curve seen in v6.
+#
+# Root cause of v6 failure: cfg_dropout was placed at the YAML top level
+# instead of under training:, so tcfg.get("cfg_dropout", 0.0) silently
+# returned 0.0. The unconditional path (text_emb=None) was never trained.
+# This caused the conditional and unconditional eps predictions to be
+# uncorrelated vectors -- linear interpolation at any intermediate CFG scale
+# produced WORSE geometry than either endpoint (0% validity at cfg=0.25-0.5
+# vs 6% uncond and 2% cond).
+#
+# Fix: cfg_dropout: 0.15 placed correctly under training:
+#   - 15% of batches see text_emb zeroed out (null conditioning)
+#   - Model learns both conditional (85%) and unconditional (15%) paths
+#   - CFG interpolation at inference becomes stable and monotone
+#
+# Additional fix: num_workers / pin_memory / persistent_workers / prefetch_factor
+# were under training: in v6, but train.py reads them from dataset: section.
+# Moved to the correct section so performance settings actually take effect.
+#
+# All other fixes inherited from v6:
+#   - use_type_grad_isolation: true (v6 geometry fix)
+#   - use_discrete_type_diffusion: true (v5 type denoising)
+#   - class_weights (v4 type collapse fix)
+#
+# Warm-init from v6/latest.pt (NOT v4) -- v6 has all prior fixes plus
+# 30k steps of type-isolation training. v7 adds CFG dropout on top.
+#
+# Usage (on pod):
+#   tmux new-session -d -s cond_v7 \
+#     "cd /workspace/Demiurge && source ~/.bashrc && \
+#      PYTHONPATH=/workspace/Demiurge/src python3 -u \
+#      scripts/train.py --config configs/train/conditional_v7.yaml \
+#      --seed 42 2>&1 | tee logs/cond_v7.log"
+
+text_conditioning: true
+
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: true   # inherited from v6: stop gradient type->geometry
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  batch_size: 128
+  lr: 1.0e-4
+  warmup_steps: 500
+  max_steps: 100000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000
+  val_every_epochs: 999999
+  val_n_scenes: 0
+  dtype: "float32"
+  use_class_balanced_sampler: true
+  weighted_sampling: false
+  class_weights: [0.508274, 0.509557, 0.524349, 0.610689, 0.576833, 0.614267, 0.649812, 0.540713, 0.785170, 0.674344, 0.658182, 0.717809, 0.614200]
+
+  # THE FIX: cfg_dropout under training: (v6 had this at top level -- silently ignored)
+  cfg_dropout: 0.15   # 15% of batches: text_emb replaced with None
+
+  # Inherited from v5/v6.
+  use_discrete_type_diffusion: true
+
+  # Warm-init from v6 (not v4): v6 has type-grad-isolation training.
+  warm_init_from: checkpoints/conditional_v6/latest.pt
+  warm_init_keys: model_state
+
+  log_every_steps: 10
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 1.0
+  presence_bce: 1.0
+
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  # Performance settings: correctly under dataset: so train.py reads them.
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+output:
+  dir: "checkpoints/conditional_v7"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v7"
+  name: "conditional_v7"
+  tags: ["model", "week4", "conditional", "d256", "v7",
+         "cfg-dropout", "discrete-type-diffusion", "type-grad-isolation", "warm-v6"]
