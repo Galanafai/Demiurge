@@ -46,6 +46,12 @@ def load_result(mode: str) -> dict | None:
     return json.loads(path.read_text())
 
 
+def load_result_from(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
 def classify_case(rates: dict[str, float | None]) -> str:
     """Heuristic case classification from the five validity rates."""
     a = rates.get("none")
@@ -90,16 +96,22 @@ def classify_case(rates: dict[str, float | None]) -> str:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
+        "--version", default="v6",
+        help="Model version tag (default: v6). Sets input file prefix to ablation_{version}_.",
+    )
+    p.add_argument(
         "--out", default=str(_ROOT / "artifacts" / "v6_ablation_table.md"),
     )
     p.add_argument("--json-out", default=None, help="Also write JSON summary")
     args = p.parse_args()
+    version = args.version
 
     rows: list[dict] = []
     rates: dict[str, float | None] = {}
 
     for mode, label in MODES:
-        r = load_result(mode)
+        path = _ROOT / "artifacts" / f"ablation_{version}_{mode}.json"
+        r = load_result_from(path)
         if r is None:
             rows.append({"label": label, "mode": mode, "status": "MISSING"})
             rates[mode] = None
@@ -149,7 +161,7 @@ def main() -> None:
     for row in rows:
         if row.get("status") == "MISSING":
             continue
-        r = load_result(row["mode"])
+        r = load_result_from(_ROOT / "artifacts" / f"ablation_{version}_{row['mode']}.json")
         if r is None:
             continue
         lines.append(f"### {row['label']}")
