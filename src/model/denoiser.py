@@ -380,7 +380,10 @@ class SceneDenoiser(nn.Module):
         def _fn(x_t: Tensor, t_idx: Tensor, _: Tensor | None) -> Tensor:
             # BROKEN: type_ids frozen at zero -- preserved for regression comparison only.
             type_ids = torch.zeros(x_t.shape[0], N_MAX, dtype=torch.long, device=x_t.device)
-            out = self.forward(x_t, type_ids, t_idx, text_emb)
+            emb = text_emb
+            if emb is not None and emb.shape[0] == 1 and x_t.shape[0] > 1:
+                emb = emb.expand(x_t.shape[0], -1)
+            out = self.forward(x_t, type_ids, t_idx, emb)
             return torch.cat([out.xyz, out.rot6d, out.scale, out.presence_logit], dim=-1)
 
         return _fn
@@ -417,7 +420,13 @@ class SceneDenoiser(nn.Module):
             type_ids: Tensor,
             t_idx: Tensor,
         ) -> tuple[Tensor, Tensor]:
-            out = self.forward(x_t, type_ids, t_idx, text_emb)
+            # Broadcast text_emb to match the actual batch size of x_t.
+            # text_emb may be (1, D_TEXT) when the sampler encodes per-prompt;
+            # x_t may be (B, N_MAX, N_CONT) with B > 1 for batched generation.
+            emb = text_emb
+            if emb is not None and emb.shape[0] == 1 and x_t.shape[0] > 1:
+                emb = emb.expand(x_t.shape[0], -1)
+            out = self.forward(x_t, type_ids, t_idx, emb)
             eps = torch.cat([out.xyz, out.rot6d, out.scale, out.presence_logit], dim=-1)
             return eps, out.type_logits
 
