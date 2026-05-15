@@ -132,29 +132,39 @@ def test_sampler_zeros_init_matches_legacy(
 ) -> None:
     """type_init='zeros' must produce the same x_cont as the legacy noise_prediction_fn.
 
-    This documents the bug: when type_ids=zeros at every step, sample_with_types
-    produces the same continuous trajectory as the old broken sampler. The type_ids
-    output will still differ (legacy returned zeros post-hoc; new sampler returns
-    argmax of head_type applied to zero-initialized type context).
+    Both paths pass type_ids=zeros to the model at every step. With zeros init,
+    sample_with_types does NOT call randint (unlike uniform init), so the Generator
+    state is consumed identically to the legacy sample() path. This verifies that
+    the only behavioral change from the fix is in the type_init prior.
+
+    Documents the bug: the continuous trajectory is identical whether we use
+    type_init='zeros' (new) or the legacy frozen-zero behavior -- confirming that
+    x_cont itself is unaffected and the collapse was purely in type prediction.
     """
     shape = (2, N_MAX, N_CONT)
     seed = 13
 
     # Legacy sampler: type_ids frozen at zero, uses old sample() API.
+    # No randint call -- generator draws only the initial Gaussian noise.
     legacy_fn = tiny_model.noise_prediction_fn(text_emb=None)
     x_legacy = sampler_5step.sample(legacy_fn, shape, seed=seed, device="cpu")
 
-    # New sampler with zeros init: should replicate the same continuous trajectory
-    # because type_ids=zeros at every step identical to legacy behavior.
+    # New sampler with zeros init: no randint call either, so Generator state
+    # is consumed identically. The continuous trajectory must be bitwise equal.
     new_fn = tiny_model.conditional_sampling_fn(text_emb=None)
-    x_new, _ = sampler_5step.sample_with_types(
+    x_new, type_ids_new = sampler_5step.sample_with_types(
         new_fn, shape, seed=seed, device="cpu", type_init="zeros"
     )
 
     assert torch.allclose(x_legacy, x_new, atol=1e-5), (
         "zeros init continuous trajectory does not match legacy sampler. "
-        "The regression baseline is broken."
+        "Generator state diverged between sample() and sample_with_types(type_init='zeros')."
     )
+    # type_ids_new reflects actual model predictions (argmax at final step),
+    # not zeros -- demonstrating the new sampler exercises head_type even
+    # when starting from the zero-init prior.
+    # (No assertion on value; just verify it ran without error.)
+    assert type_ids_new.shape == (shape[0], shape[1])
 
 
 # ---------------------------------------------------------------------------
