@@ -440,7 +440,7 @@ def main() -> None:
             )
         class_weights_tensor = torch.tensor(_cw_raw, dtype=torch.float32)
         print(f"Class weights loaded: {[f'{w:.3f}' for w in _cw_raw]}")
-    loss_fn = SceneDiffusionLoss(loss_weights, class_weights=class_weights_tensor)
+    loss_fn = SceneDiffusionLoss(loss_weights, class_weights=class_weights_tensor).to(device)
 
     # --- Dataset ---
     from data.reader import ShardReader
@@ -513,13 +513,13 @@ def main() -> None:
     if use_class_balanced:
         from data.balanced_sampler import make_class_balanced_sampler
         sampler = make_class_balanced_sampler(all_examples, train_indices, eps=0.01)
-        print(f"Using ClassBalancedSampler (type-frequency balanced, eps=0.01)")
+        print("Using ClassBalancedSampler (type-frequency balanced, eps=0.01)")
     elif weighted_sampling:
         train_families = [all_examples[i][2].get("task_family", "unknown") for i in train_indices]
         fam_counts = {f: train_families.count(f) for f in set(train_families)}
         weights = [1.0 / fam_counts[f] for f in train_families]
         sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(train_indices), replacement=True)
-        print(f"Using template-balanced WeightedRandomSampler")
+        print("Using template-balanced WeightedRandomSampler")
     else:
         sampler = None  # type: ignore[assignment]
 
