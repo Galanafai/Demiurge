@@ -195,3 +195,28 @@ def test_noise_prediction_fn_backward_compat(
     t = torch.zeros(2, dtype=torch.long)
     eps = fn(x_t, t, None)
     assert eps.shape == (2, N_MAX, N_CONT), f"Legacy fn eps shape {eps.shape}"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: PAD token never emitted
+# ---------------------------------------------------------------------------
+
+
+def test_sampler_no_pad_token_emitted(
+    tiny_model: SceneDenoiser, sampler_5step: DDIMSampler
+) -> None:
+    """sample_with_types must never emit type_id == n_valid_types (PAD token).
+
+    The PAD token (default index 12) is masked to -inf before argmax, so the
+    sampler output should be strictly in [0, n_valid_types).
+    """
+    fn = tiny_model.conditional_sampling_fn(text_emb=None)
+    n_valid = 12  # default
+    _, type_ids = sampler_5step.sample_with_types(
+        fn, (10, N_MAX, N_CONT), seed=0, device="cpu", n_valid_types=n_valid
+    )
+    assert type_ids.max().item() < n_valid, (
+        f"PAD token emitted: max type_id={type_ids.max().item()} >= n_valid_types={n_valid}"
+    )
+    assert type_ids.min().item() >= 0
+

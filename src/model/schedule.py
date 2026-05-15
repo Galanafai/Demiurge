@@ -361,6 +361,13 @@ class DDIMSampler:
             # Forward pass: get both eps and type logits.
             eps_pred, type_logits = fn(x_t, type_ids, t_tensor)
 
+            # Mask out the PAD token (index n_valid_types and above) so argmax
+            # never selects vocabulary entries outside [0, n_valid_types).
+            # This prevents the sampler from emitting PAD-type objects at inference.
+            if n_valid_types < type_logits.shape[-1]:
+                type_logits = type_logits.clone()
+                type_logits[..., n_valid_types:] = float("-inf")
+
             # Update type_ids from this step's logits before the continuous update.
             # Greedy argmax: deterministic, consistent with DDIM eta=0 spirit.
             type_ids = type_logits.argmax(dim=-1)  # (B, N_MAX)
