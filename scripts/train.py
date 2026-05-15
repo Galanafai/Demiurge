@@ -369,6 +369,7 @@ def main() -> None:
         n_heads=mcfg_raw.get("n_heads", 8),
         ffn_mult=mcfg_raw.get("ffn_mult", 4),
         dropout=mcfg_raw.get("dropout", 0.1),
+        use_type_grad_isolation=bool(mcfg_raw.get("use_type_grad_isolation", False)),
     )
     model = SceneDenoiser(dcfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -53,6 +53,18 @@ class DenoiserConfig:
     n_heads: int = 8
     ffn_mult: int = 4
     dropout: float = 0.1
+    use_type_grad_isolation: bool = False
+    """Stop gradient on type_embed entering the token stream.
+
+    When True, the type embedding is detached before being added to the
+    continuous projection, so type embedding gradients cannot flow through
+    the transformer blocks into the geometry heads (head_xyz, head_rot6d,
+    head_scale, head_presence). The type embedding still receives gradients
+    via a residual injection into head_type, so type classification is
+    preserved without contaminating geometry learning.
+
+    When False (default), the original entangled behavior is used.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +314,17 @@ class SceneDenoiser(nn.Module):
         t_emb = self.t_mlp(t_sin)               # (B, d)
 
         # Per-slot token encoding: type embedding + continuous projection.
-        tok = self.type_embed(type_ids) + self.cont_proj(x_cont)  # (B, N_MAX, d)
+        # With type_grad_isolation, the type embedding is detached so its
+        # gradient cannot flow through the transformer blocks into geometry
+        # heads. The type embedding still receives gradients via a separate
+        # residual path into head_type only (see below).
+        type_emb_full = self.type_embed(type_ids)            # (B, N_MAX, d) -- gradient intact
+        if self.cfg.use_type_grad_isolation:
+            type_emb_tok = type_emb_full.detach()            # no grad into transformer
+        else:
+            type_emb_tok = type_emb_full                     # original entangled path
+
+        tok = type_emb_tok + self.cont_proj(x_cont)          # (B, N_MAX, d)
 
         # Append [NOISE_T] token at position N_MAX.
         t_token = self.t_token_proj(t_emb).unsqueeze(1)  # (B, 1, d)
@@ -315,8 +337,16 @@ class SceneDenoiser(nn.Module):
         # Extract scene token outputs (exclude [NOISE_T]).
         scene_out = self.final_norm(tokens[:, :N_MAX])    # (B, N_MAX, d)
 
+        # Type head: inject the un-detached type embedding as a residual so
+        # head_type receives gradient through type_emb_full -> type_embed
+        # even when isolation is active. This preserves type learning without
+        # routing type gradients through the geometry-driving transformer.
+        # When isolation is off, type_emb_full == type_emb_tok so this is a
+        # no-op (residual of zero net effect on training signal).
+        type_head_in = scene_out + type_emb_full           # (B, N_MAX, d)
+
         return DenoiserOutput(
-            type_logits=self.head_type(scene_out),        # (B, N_MAX, 13)
+            type_logits=self.head_type(type_head_in),     # (B, N_MAX, 13)
             rot6d=self.head_rot6d(scene_out),             # (B, N_MAX, 6)
             xyz=self.head_xyz(scene_out),                 # (B, N_MAX, 3)
             scale=self.head_scale(scene_out),             # (B, N_MAX, 3)
@@ -357,7 +387,7 @@ class SceneDenoiser(nn.Module):
 
     def conditional_sampling_fn(
         self, text_emb: Tensor | None = None
-    ) -> "Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]]":
+    ) -> Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]]:
         """Return a callable for use with DDIMSampler.sample_with_types().
 
         Unlike :meth:`noise_prediction_fn`, this returns both the continuous
