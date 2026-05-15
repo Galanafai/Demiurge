@@ -51,11 +51,13 @@ def test_isolation_enabled_blocks_geometry_gradient() -> None:
     loss = out.xyz.sum()
     loss.backward()
 
-    # type_embed.weight must have zero gradient because the detach() breaks
+    # type_embed.weight must have zero or None gradient because the detach() breaks
     # the gradient path from xyz head -> transformer -> type_embed.
+    # When fully detached, PyTorch does not allocate .grad at all (None), which is
+    # equivalent to zero -- no gradient reached the leaf.
     grad = model.type_embed.weight.grad
-    assert grad is not None, "type_embed.weight.grad is None -- no grad flowed at all"
-    assert grad.abs().max().item() == pytest.approx(0.0, abs=1e-7), (
+    is_zero_grad = grad is None or grad.abs().max().item() == pytest.approx(0.0, abs=1e-7)
+    assert is_zero_grad, (
         f"Geometry loss produced non-zero grad on type_embed.weight "
         f"(max={grad.abs().max().item():.2e}) -- isolation is not working."
     )
@@ -134,17 +136,17 @@ def test_geometry_heads_train_independently() -> None:
         "head_xyz.weight has zero gradient from xyz loss -- geometry path broken."
     )
 
-    # type_embed must have zero gradient (isolated from geometry).
+    # type_embed must have zero or None gradient (isolated from geometry).
     te_grad = model.type_embed.weight.grad
-    assert te_grad is not None
-    assert te_grad.abs().max().item() == pytest.approx(0.0, abs=1e-7), (
+    is_zero = te_grad is None or te_grad.abs().max().item() == pytest.approx(0.0, abs=1e-7)
+    assert is_zero, (
         "type_embed.weight has non-zero gradient from xyz loss -- isolation broken."
     )
 
-    # head_type.weight must also have zero gradient (no type loss was computed).
+    # head_type.weight must also have zero or None gradient (no type loss).
     ht_grad = model.head_type.weight.grad
-    assert ht_grad is not None
-    assert ht_grad.abs().max().item() == pytest.approx(0.0, abs=1e-7), (
+    is_zero_ht = ht_grad is None or ht_grad.abs().max().item() == pytest.approx(0.0, abs=1e-7)
+    assert is_zero_ht, (
         "head_type.weight has non-zero gradient from xyz-only loss -- unexpected."
     )
 
