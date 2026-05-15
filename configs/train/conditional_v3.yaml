@@ -1,0 +1,90 @@
+# Training configuration for Demiurge conditional DDPM -- conditional_v3
+#
+# Three changes from conditional_v2:
+#   1. Throughput: num_workers=4, bf16 AMP, batch_size=256, mp.set_sharing_strategy
+#   2. Training length: 200k steps (double v2)
+#   3. Cosine LR with warm restart at step 100k
+#
+# Probe results on v2 before this run:
+#   model_state: 15.0% [11.9, 18.1]%  (500-scene Drake probe)
+#   ema_state:   17.0% [13.7, 20.3]%  (500-scene Drake probe)
+#   baseline:     5.4% (unconditional_v3)
+#
+#   uv run python scripts/train.py --config configs/train/conditional_v3.yaml --seed 42
+#
+
+# --- Text conditioning ---
+text_conditioning: true
+
+# --- Model (unchanged from v2) ---
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+
+# --- Diffusion schedule (unchanged) ---
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+# --- Training loop ---
+training:
+  batch_size: 256           # up from 128; VRAM headroom confirmed on RTX 5080
+  lr: 3.0e-4
+  warmup_steps: 1000
+  max_steps: 200000         # double v2's 100k to push through plateau
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000
+  val_every_epochs: 50
+  val_n_scenes: 50
+  dtype: "bfloat16"         # bf16 AMP; RTX 5080 Blackwell has native bf16 support
+  weighted_sampling: true
+
+  # CFG dropout: unchanged from v2 (0.15 fixed the presence-collapse of v1)
+  cfg_dropout: 0.15
+
+  # LR restart: jump to 1e-4 at step 100k, cosine decay to 3e-6 by step 200k.
+  # Gives optimizer a chance to escape the v2 plateau at epoch ~50.
+  cosine_restart_step: 100000
+  cosine_restart_lr: 1.0e-4
+
+  # W&B logging: every step logs are expensive at high throughput; gate at 50.
+  log_every_steps: 50
+
+  # Warm-init from unconditional_v3 (same as v2; fresh restart not v2 checkpoint)
+  warm_init_from: checkpoints/unconditional_v3_pres1.0/latest.pt
+  warm_init_keys: model_state
+
+# --- Loss weights (v3 Pareto optimum, unchanged) ---
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 0.1
+  presence_bce: 1.0
+
+# --- Dataset ---
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  num_workers: 4            # re-enabled with file_system sharing strategy fix
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+# --- Output ---
+output:
+  dir: "checkpoints/conditional_v3"
+
+# --- W&B ---
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v3"
+  tags: ["model", "week3.5", "conditional", "d256", "v3", "pres1.0", "cfg0.15",
+         "warm-init-v3", "bf16", "lr-restart", "200k"]
