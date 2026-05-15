@@ -180,6 +180,7 @@ def load_model(ckpt_path: Path, device: torch.device) -> SceneDenoiser:
     cfg = DenoiserConfig(
         n_layers=arch["n_layers"], d_model=arch["d_model"],
         n_heads=arch["n_heads"], ffn_mult=arch["ffn_mult"], dropout=0.0,
+        use_type_grad_isolation=arch.get("use_type_grad_isolation", False),
     )
     model = SceneDenoiser(cfg).to(device)
     model.load_state_dict(ckpt["ema_state"])
