@@ -55,14 +55,14 @@ training:
   use_class_balanced_sampler: true
   # weighted_sampling is overridden by use_class_balanced_sampler when true.
   weighted_sampling: false
-  # IMPORTANT: replace placeholder values with output of compute_class_distribution.py
-  # before launching training. The placeholder assertion in train.py will reject
-  # values containing 0.0 or 1.0, so this config cannot be run without running
-  # the audit first.
-  #
-  # To generate: PYTHONPATH=src python3 scripts/compute_class_distribution.py \
-  #   --data-dir data/v1 --eps 0.01
-  class_weights: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  # class_weights from scripts/compute_class_distribution.py on data/v1 (50k scenes).
+  # Active types (0-11): mildly imbalanced (6.17% to 10.08%), inv-freq range [0.51, 0.79].
+  # Type collapse was primarily caused by type_ce=0.1, not severe data imbalance.
+  # PAD class (type_id=12): 0 occurrences -- weight capped at mean of active weights (0.61)
+  # rather than the computed 5.63 (zero-count inverse). No training example ever has
+  # type_id=12 as a present-slot target, so the exact value here is irrelevant, but
+  # 5.63 could produce NaN in degenerate batches.
+  class_weights: [0.508274, 0.509557, 0.524349, 0.610689, 0.576833, 0.614267, 0.649812, 0.540713, 0.785170, 0.674344, 0.658182, 0.717809, 0.614200]
 
   cfg_dropout: 0.15
 
