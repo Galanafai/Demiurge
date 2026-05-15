@@ -30,13 +30,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import torch
-import yaml
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
 
 from data.reader import ShardReader  # noqa: E402
-from model.denoiser import DenoiserConfig, N_MAX, SceneDenoiser  # noqa: E402
+from model.denoiser import N_MAX, DenoiserConfig, SceneDenoiser  # noqa: E402
 from model.rotations import rot6d_to_quat_wxyz  # noqa: E402
 from model.schedule import CosineSchedule, DDIMSampler  # noqa: E402
 from scene.schema import SceneTensor, WorkspaceBounds  # noqa: E402
@@ -194,27 +193,43 @@ def load_model(ckpt_path: Path, device: torch.device) -> SceneDenoiser:
 # ---------------------------------------------------------------------------
 
 
-def vlm_score(client: object, model_id: str, description: str, scene_text: str) -> tuple[int, str]:
-    """Return (score 1-5, reasoning)."""
+def _strip_fences(text: str) -> str:
+    """Strip markdown code fences that LLMs sometimes wrap JSON in."""
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def vlm_score(client: object, model_id: str, description: str, scene_text: str) -> tuple[int, str, int, int, str]:
+    """Return (score 1-5, reasoning, in_tok, out_tok, raw_response)."""
     user_msg = f"Task description: {description}\n\n{scene_text}"
     resp = client.messages.create(
         model=model_id,
-        max_tokens=200,
+        max_tokens=500,
         temperature=0,
         system=JUDGE_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
     raw = resp.content[0].text.strip()
-    # Extract JSON -- handle markdown fences
-    m = re.search(r'\{.*?"score".*?\}', raw, re.DOTALL)
-    if not m:
-        raise ValueError(f"No JSON in VLM response: {raw[:100]!r}")
-    parsed = json.loads(m.group())
-    score = int(parsed["score"])
-    reasoning = str(parsed.get("reasoning", ""))
     in_tok = resp.usage.input_tokens
     out_tok = resp.usage.output_tokens
-    return score, reasoning, in_tok, out_tok
+    # Try fence-stripped version first, then raw.
+    for candidate in (_strip_fences(raw), raw):
+        m = re.search(r'\{.*?"score".*?\}', candidate, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+                score = int(parsed["score"])
+                reasoning = str(parsed.get("reasoning", ""))
+                return score, reasoning, in_tok, out_tok, raw
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+    raise ValueError(f"No JSON in VLM response: {raw[:120]!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +339,10 @@ def main() -> None:
             # VLM scoring
             score_val: int | None = None
             reasoning = ""
+            raw_response = ""
             if client is not None and total_cost < args.budget_usd:
                 try:
-                    score_val, reasoning, in_tok, out_tok = vlm_score(
+                    score_val, reasoning, in_tok, out_tok, raw_response = vlm_score(
                         client, args.vlm_model, desc, scene_text
                     )
                     cost = in_tok * pricing["input"] + out_tok * pricing["output"]
@@ -353,6 +369,7 @@ def main() -> None:
                 ),
                 "vlm_score": score_val,
                 "vlm_reasoning": reasoning,
+                "vlm_raw_response": raw_response,
                 "type_ids": st_norm.object_types[present_mask].tolist(),
             })
 
@@ -388,17 +405,17 @@ def main() -> None:
     print(f"  Scenes evaluated:  {drake_total}")
     print(f"  Empty scenes:      {n_empty}")
     print(f"  Drake validity:    {validity_rate*100:.1f}%  ({drake_accepted}/{drake_total})")
-    print(f"")
+    print("")
     if gate1_score is not None:
         g1 = "PASS" if gate1_score > 2.0 else "FAIL"
         print(f"  Gate 1 VLM mean:   {gate1_score:.3f} (threshold >2.0) [{g1}]")
     else:
-        print(f"  Gate 1 VLM mean:   N/A (VLM skipped)")
+        print("  Gate 1 VLM mean:   N/A (VLM skipped)")
     if gate2_frac is not None:
         g2 = "PASS" if gate2_frac > 0.05 else "FAIL"
         print(f"  Gate 2 Joint ok:   {gate2_frac*100:.1f}% (threshold >5%) [{g2}]")
     else:
-        print(f"  Gate 2 Joint ok:   N/A (VLM skipped)")
+        print("  Gate 2 Joint ok:   N/A (VLM skipped)")
     g3 = "PASS" if gate3_pass else "FAIL"
     print(f"  Gate 3 Type div:   {gate3_types}/12 types seen (threshold >=5) [{g3}]")
     print(f"  Type 0 fraction:   {type_0_frac*100:.1f}% (was 99% in v2/v3)")
