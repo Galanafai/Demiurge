@@ -78,7 +78,7 @@ def _add_noise(
     rng: torch.Generator,
 ) -> torch.Tensor:
     """Apply forward diffusion noise at timestep t."""
-    alpha_bar = float(schedule.alpha_bar[t])
+    alpha_bar = float(schedule.alpha_bar(torch.tensor([t], dtype=torch.long)))
     sqrt_ab = alpha_bar ** 0.5
     sqrt_one_minus_ab = (1.0 - alpha_bar) ** 0.5
     eps = torch.randn_like(x0, generator=rng)
