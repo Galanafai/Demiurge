@@ -93,24 +93,30 @@ def serialize_scene(st: SceneTensor, bounds: WorkspaceBounds) -> str:
     return "\n".join(parts)
 
 
-def decode_scene(x0_i: torch.Tensor, bounds: WorkspaceBounds) -> SceneTensor:
-    """Decode a single (N_MAX, 13) raw denoised tensor into a SceneTensor.
+def decode_scene(
+    x_cont_i: torch.Tensor,
+    type_ids_i: torch.Tensor,
+    bounds: WorkspaceBounds,
+) -> SceneTensor:
+    """Decode a single (N_MAX, N_CONT) x_cont slice + (N_MAX,) type_ids into a SceneTensor.
 
-    Channel layout:
-      0     : type_id (continuous, round+clamp to get integer)
-      1-3   : xyz normalised
-      3-9   : rot6d
-      9-12  : scale normalised
-      12    : presence logit (> 0 => present)
+    x_cont channel layout (N_CONT=13):
+      0-2  : xyz normalised
+      3-8  : rot6d
+      9-11 : scale normalised
+      12   : presence logit (> 0 => present)
+
+    type_ids are provided by the sampler (argmax of head_type logits at
+    each DDIM step) rather than being decoded from x_cont -- x_cont does
+    not encode type in any channel.
     """
-    presence = x0_i[:, 12] > 0.0                                 # (N_MAX,)
-    type_ids = x0_i[:, 0].round().long().clamp(0, len(OBJECT_VOCAB) - 1)  # (N_MAX,)
-    quats = rot6d_to_quat_wxyz(x0_i[:, 3:9])                     # (N_MAX, 4)
-    poses = torch.cat([x0_i[:, :3].clamp(-1, 1), quats], dim=-1) # (N_MAX, 7)
+    presence = x_cont_i[:, 12] > 0.0                          # (N_MAX,)
+    quats = rot6d_to_quat_wxyz(x_cont_i[:, 3:9])              # (N_MAX, 4)
+    poses = torch.cat([x_cont_i[:, :3].clamp(-1, 1), quats], dim=-1)  # (N_MAX, 7)
     return SceneTensor(
-        object_types=type_ids.cpu(),
+        object_types=type_ids_i.cpu(),
         poses=poses.cpu(),
-        scales=x0_i[:, 9:12].clamp(-1, 1).cpu(),
+        scales=x_cont_i[:, 9:12].clamp(-1, 1).cpu(),
         presence=presence.cpu(),
     )
 
@@ -282,12 +288,20 @@ def main() -> None:
             continue
 
         seed = hash((args.seed, desc_id)) & 0xFFFFFFFF
-        fn = model.noise_prediction_fn(text_emb.expand(args.n_per_prompt, -1))
+        sampling_fn = model.conditional_sampling_fn(
+            text_emb.expand(args.n_per_prompt, -1)
+        )
         with torch.no_grad():
-            x0 = sampler.sample(fn, (args.n_per_prompt, N_MAX, 13), seed=seed, device=device)
+            x_cont_batch, type_ids_batch = sampler.sample_with_types(
+                sampling_fn,
+                (args.n_per_prompt, N_MAX, 13),
+                seed=seed,
+                device=device,
+                type_init="uniform",
+            )
 
         for s_idx in range(args.n_per_prompt):
-            st_norm = decode_scene(x0[s_idx], bounds)
+            st_norm = decode_scene(x_cont_batch[s_idx], type_ids_batch[s_idx], bounds)
             st_phys = st_norm.denormalize(bounds)
 
             # Type distribution

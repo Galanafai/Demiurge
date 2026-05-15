@@ -50,6 +50,9 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--rrt-budget", type=float, default=2.0,
                    help="Seconds per RRT attempt in Drake validator")
+    p.add_argument("--type-init", choices=["uniform", "zeros"], default="uniform",
+                   help="Type ID initialisation: 'uniform' (fixed sampler) or "
+                        "'zeros' (legacy broken behavior for regression comparison)")
     p.add_argument("--out", default=None, help="Optional JSON output path")
     args = p.parse_args()
 
@@ -89,7 +92,9 @@ def main() -> None:
     ddim_steps = int(ddim_cfg.get("ddim_steps", 50))
     schedule = CosineSchedule(T=T)
     sampler = DDIMSampler(schedule, n_steps=ddim_steps)
-    fn = model.noise_prediction_fn(text_emb=None)
+    # Use the type-aware sampling fn. noise_prediction_fn is the legacy broken
+    # variant (type_ids frozen at zero) -- kept only for regression comparison.
+    sampling_fn = model.conditional_sampling_fn(text_emb=None)
 
     validator = SceneValidator(rrt_budget_s=args.rrt_budget)
 
@@ -109,22 +114,25 @@ def main() -> None:
     with torch.no_grad():
         while remaining > 0:
             b = min(args.batch_size, remaining)
-            x0 = sampler.sample(fn, (b, N_MAX, 13), seed=rng_seed, device=device)
+            x_cont, type_ids_batch = sampler.sample_with_types(
+                sampling_fn, (b, N_MAX, 13),
+                seed=rng_seed, device=device,
+                type_init=args.type_init,
+            )
             rng_seed += 1
             remaining -= b
 
-            xyz = x0[:, :, :3].clamp(-1.0, 1.0)
-            rot6d_pred = x0[:, :, 3:9]
-            scale_pred = x0[:, :, 9:12].clamp(-1.0, 1.0)
-            pres_bit = x0[:, :, 12]
+            xyz = x_cont[:, :, :3].clamp(-1.0, 1.0)
+            rot6d_pred = x_cont[:, :, 3:9]
+            scale_pred = x_cont[:, :, 9:12].clamp(-1.0, 1.0)
+            pres_bit = x_cont[:, :, 12]
 
             for i in range(b):
                 pres_mask = pres_bit[i] > 0.0
                 quats = rot6d_to_quat_wxyz(rot6d_pred[i])
                 poses_raw = torch.cat([xyz[i], quats], dim=-1)
-                types = torch.zeros(N_MAX, dtype=torch.long)
                 st_norm = SceneTensor(
-                    object_types=types,
+                    object_types=type_ids_batch[i].cpu(),
                     poses=poses_raw.cpu(),
                     scales=scale_pred[i].cpu(),
                     presence=pres_mask.cpu(),
@@ -170,6 +178,8 @@ def main() -> None:
         "rejection_reasons": rejection_reasons,
         "elapsed_s": elapsed,
         "seed": args.seed,
+        "type_init": args.type_init,
+        "sampler": "sample_with_types",
     }
 
     if args.out:

@@ -328,10 +328,17 @@ class SceneDenoiser(nn.Module):
     ) -> Callable[[Tensor, Tensor, Tensor | None], Tensor]:
         """Return a callable compatible with DDIMSampler.sample().
 
+        .. deprecated::
+            This method passes ``type_ids=zeros`` at every denoising step,
+            creating a training/inference mismatch that causes type collapse.
+            Use :meth:`conditional_sampling_fn` with
+            :meth:`~model.schedule.DDIMSampler.sample_with_types` instead.
+
         The returned function packs the full DenoiserOutput back into a
         single (B, N_MAX, N_CONT) noise-prediction tensor for the DDIM loop.
-        Type ids are treated as zeros during sampling (argmax of logits is
-        applied post-hoc, not during denoising).
+        type_ids are frozen at zero throughout sampling; type logits are
+        discarded. This replicates the original (broken) behavior and is
+        preserved only for regression testing.
 
         Args:
             text_emb: Optional text embedding to close over.
@@ -341,10 +348,48 @@ class SceneDenoiser(nn.Module):
             shape (B, N_MAX, N_CONT) and eps_pred has the same shape.
         """
         def _fn(x_t: Tensor, t_idx: Tensor, _: Tensor | None) -> Tensor:
-            # Dummy type ids: zeros (will be replaced post-sampling).
+            # BROKEN: type_ids frozen at zero -- preserved for regression comparison only.
             type_ids = torch.zeros(x_t.shape[0], N_MAX, dtype=torch.long, device=x_t.device)
             out = self.forward(x_t, type_ids, t_idx, text_emb)
-            # Pack continuous noise predictions back into (B, N_MAX, 13).
             return torch.cat([out.xyz, out.rot6d, out.scale, out.presence_logit], dim=-1)
 
         return _fn
+
+    def conditional_sampling_fn(
+        self, text_emb: Tensor | None = None
+    ) -> "Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]]":
+        """Return a callable for use with DDIMSampler.sample_with_types().
+
+        Unlike :meth:`noise_prediction_fn`, this returns both the continuous
+        noise prediction *and* the type logits, allowing the DDIM loop to
+        update ``type_ids`` at each step from the model's own predictions.
+
+        This closes the training/inference gap: the model was trained with
+        clean ``type_ids`` supplied at every step; this callable lets the
+        sampler maintain ``type_ids`` state across steps via argmax of
+        ``head_type`` output, approximating the training distribution.
+
+        Args:
+            text_emb: Optional frozen text embedding (B, D_TEXT=384).
+                Pass None for unconditional generation.
+
+        Returns:
+            Callable ``(x_t, type_ids, t) -> (eps_pred, type_logits)``
+            where:
+              - ``x_t``: (B, N_MAX, N_CONT) noisy continuous features
+              - ``type_ids``: (B, N_MAX) long tensor, current type estimate
+              - ``t``: (B,) long timestep tensor
+              - ``eps_pred``: (B, N_MAX, N_CONT) predicted noise
+              - ``type_logits``: (B, N_MAX, N_TYPE) raw type logits
+        """
+        def _fn(
+            x_t: Tensor,
+            type_ids: Tensor,
+            t_idx: Tensor,
+        ) -> tuple[Tensor, Tensor]:
+            out = self.forward(x_t, type_ids, t_idx, text_emb)
+            eps = torch.cat([out.xyz, out.rot6d, out.scale, out.presence_logit], dim=-1)
+            return eps, out.type_logits
+
+        return _fn
+
