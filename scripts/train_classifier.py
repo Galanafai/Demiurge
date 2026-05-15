@@ -164,6 +164,10 @@ def main() -> None:
     lr = float(tcfg.get("lr", 3e-4))
     warmup_steps = int(tcfg.get("warmup_steps", 500))
     auc_threshold = float(tcfg.get("auc_threshold", 0.85))
+    # pos_weight balances imbalanced BCE: n_invalid / n_valid.
+    # Default 1.0 (unweighted). Set in config based on dataset manifest.
+    pos_weight_val = float(tcfg.get("pos_weight", 1.0))
+    n_epochs = int(tcfg.get("n_epochs", 1))
 
     mcfg = cfg.get("model", {})
     d_model = int(mcfg.get("d_model", 128))
@@ -199,7 +203,9 @@ def main() -> None:
     print(f"ValidityClassifier: {n_params/1e6:.2f}M parameters")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = nn.BCEWithLogitsLoss()
+    pos_weight = torch.tensor([pos_weight_val], device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    print(f"BCEWithLogitsLoss pos_weight: {pos_weight_val:.4f}")
 
     # Linear warmup scheduler.
     def _lr_lambda(step: int) -> float:
@@ -209,34 +215,36 @@ def main() -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
-    # --- Training loop (one epoch) ---
+    # --- Training loop ---
     model.train()
     step = 0
     t0 = time.monotonic()
     total_loss = 0.0
+    print(f"Training for {n_epochs} epoch(s) ...")
 
-    for batch in train_loader:
-        xt = batch["xt"].to(device)
-        t_idx = batch["t"].to(device)
-        type_ids = batch["type_ids"].to(device)
-        labels = batch["label"].to(device)
+    for _epoch in range(n_epochs):
+        for batch in train_loader:
+            xt = batch["xt"].to(device)
+            t_idx = batch["t"].to(device)
+            type_ids = batch["type_ids"].to(device)
+            labels = batch["label"].to(device)
 
-        optimizer.zero_grad()
-        logit = model(xt, type_ids, t_idx)
-        loss = criterion(logit, labels)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
+            optimizer.zero_grad()
+            logit = model(xt, type_ids, t_idx)
+            loss = criterion(logit, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
 
-        total_loss += loss.item()
-        step += 1
+            total_loss += loss.item()
+            step += 1
 
-        if step % 100 == 0:
-            avg_loss = total_loss / step
-            print(f"  step={step:5d} | loss={avg_loss:.4f} | lr={scheduler.get_last_lr()[0]:.2e}")
-            if wandb_run is not None:
-                wandb_run.log({"train/loss": avg_loss, "step": step})
+            if step % 100 == 0:
+                avg_loss = total_loss / step
+                print(f"  step={step:5d} | loss={avg_loss:.4f} | lr={scheduler.get_last_lr()[0]:.2e}")
+                if wandb_run is not None:
+                    wandb_run.log({"train/loss": avg_loss, "step": step})
 
     elapsed = time.monotonic() - t0
     print(f"\nTraining complete: {step} steps in {elapsed:.1f}s")
