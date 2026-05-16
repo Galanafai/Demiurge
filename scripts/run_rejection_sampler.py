@@ -29,7 +29,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from data.reader import ShardReader
-from model.denoiser import DenoiserConfig, SceneDenoiser, N_MAX
+from model.denoiser import N_MAX, DenoiserConfig, SceneDenoiser
 from model.rotations import rot6d_to_quat_wxyz
 from model.schedule import CosineSchedule, DDIMSampler
 from scene.schema import SceneTensor, WorkspaceBounds
