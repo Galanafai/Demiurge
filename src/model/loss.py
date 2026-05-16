@@ -41,6 +41,16 @@ class LossWeights:
     scale: float = 0.5
     type_ce: float = 0.1
     presence_bce: float = 0.05
+    slot_diversity: float = 0.0
+    """Weight for the slot-diversity penalty.
+
+    Penalises high cosine similarity between predicted XYZ noise across slots,
+    encouraging the model to learn distinct positions for each object slot
+    rather than collapsing all slots to the same spatial mode.
+
+    Recommended value for anti-collapse training: 0.05.
+    Default 0.0 disables the penalty (backward compatible).
+    """
 
 
 @dataclass
@@ -57,10 +67,11 @@ class LossOutput:
     scale: Tensor
     type_ce: Tensor
     presence_bce: Tensor
+    slot_diversity: Tensor | None = None
 
     def as_log_dict(self) -> dict[str, float]:
         """Return all components (including total) as float values."""
-        return {
+        d = {
             "total": float(self.total.detach().item()),
             "pose_xyz": float(self.pose_xyz.detach().item()),
             "pose_rot": float(self.pose_rot.detach().item()),
@@ -68,6 +79,9 @@ class LossOutput:
             "type_ce": float(self.type_ce.detach().item()),
             "presence_bce": float(self.presence_bce.detach().item()),
         }
+        if self.slot_diversity is not None:
+            d["slot_diversity"] = float(self.slot_diversity.detach().item())
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +187,23 @@ class SceneDiffusionLoss(torch.nn.Module):
             + w.presence_bce * loss_pres
         )
 
+        # --- Slot diversity penalty (optional) ---
+        # Penalise high mean pairwise cosine similarity between predicted XYZ
+        # noise across slots. This discourages the collapse mode where all
+        # slots predict the same position. Only computed when weight > 0.
+        loss_div: Tensor | None = None
+        if w.slot_diversity > 0.0:
+            xyz_pred = pred.xyz                         # (B, N_MAX, 3)
+            xyz_norm = F.normalize(xyz_pred, dim=-1)    # unit vectors (B, N_MAX, 3)
+            # Gram matrix of cosine similarities: (B, N_MAX, N_MAX)
+            gram = torch.bmm(xyz_norm, xyz_norm.transpose(1, 2))
+            # Mean off-diagonal similarity (exclude self-similarity on diagonal).
+            eye = torch.eye(gram.shape[1], device=gram.device).unsqueeze(0)
+            off_diag = gram * (1.0 - eye)
+            n_pairs = gram.shape[1] * (gram.shape[1] - 1)
+            loss_div = off_diag.sum() / (gram.shape[0] * max(n_pairs, 1))
+            total = total + w.slot_diversity * loss_div
+
         return LossOutput(
             total=total,
             pose_xyz=loss_xyz,
@@ -180,4 +211,5 @@ class SceneDiffusionLoss(torch.nn.Module):
             scale=loss_scale,
             type_ce=loss_type,
             presence_bce=loss_pres,
+            slot_diversity=loss_div,
         )

@@ -65,6 +65,18 @@ class DenoiserConfig:
 
     When False (default), the original entangled behavior is used.
     """
+    use_slot_id_embed: bool = False
+    """Add a learnable per-slot position embedding to break slot symmetry.
+
+    When True, a learnable Embedding(N_MAX, d_model) is added to each slot
+    token *before* the transformer blocks. This breaks the permutation
+    symmetry that causes all slots to collapse to the same mode when
+    training from scratch at large model sizes. The embedding is
+    orthogonally initialized to maximally separate slots in embedding space.
+
+    Should be True for from-scratch large models (>=20M params).
+    When False (default), no slot ID embedding is added (set-equivariant).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +249,13 @@ class SceneDenoiser(nn.Module):
         self.type_embed = nn.Embedding(N_TYPE, d)
         self.cont_proj = nn.Linear(N_CONT, d)
 
+        # Optional per-slot learnable position embedding (slot-ID embed).
+        # Breaks permutation symmetry at large model scales to prevent
+        # all slots collapsing to the same spatial mode.
+        self.slot_id_embed: nn.Embedding | None = (
+            nn.Embedding(N_MAX, d) if cfg.use_slot_id_embed else None
+        )
+
         # [NOISE_T] token: project timestep embedding to a single token.
         self.t_token_proj = nn.Linear(d, d)
 
@@ -274,6 +293,10 @@ class SceneDenoiser(nn.Module):
 
         AdaLN linear layers: zero-init so scale=0 and shift=0 at start,
         equivalent to standard LayerNorm on the first forward pass.
+
+        Slot ID embed (if enabled): orthogonal init so all N_MAX slot vectors
+        are maximally separated in embedding space from the start, preventing
+        attention from collapsing all slots to the same representation.
         """
         # Continuous noise heads: zero biases only.
         for head in (self.head_rot6d, self.head_xyz, self.head_scale):
@@ -286,6 +309,12 @@ class SceneDenoiser(nn.Module):
             if isinstance(block, _DenoiserBlock):
                 nn.init.zeros_(block.adaln.weight)
                 nn.init.zeros_(block.adaln.bias)
+        # Slot ID embed: orthogonal init for maximal slot separation.
+        if self.slot_id_embed is not None:
+            # nn.init.orthogonal_ requires (rows >= cols); slot_id_embed.weight
+            # is (N_MAX=12, d_model); since d_model >> N_MAX transpose trick:
+            w = self.slot_id_embed.weight  # (N_MAX, d)
+            nn.init.orthogonal_(w)
 
     def forward(
         self,
@@ -325,6 +354,12 @@ class SceneDenoiser(nn.Module):
             type_emb_tok = type_emb_full                     # original entangled path
 
         tok = type_emb_tok + self.cont_proj(x_cont)          # (B, N_MAX, d)
+
+        # Add slot ID embedding if enabled.
+        # Slot IDs are fixed 0..N_MAX-1 and broadcast over the batch.
+        if self.slot_id_embed is not None:
+            slot_ids = torch.arange(N_MAX, device=x_cont.device)  # (N_MAX,)
+            tok = tok + self.slot_id_embed(slot_ids).unsqueeze(0)  # (B, N_MAX, d)
 
         # Append [NOISE_T] token at position N_MAX.
         t_token = self.t_token_proj(t_emb).unsqueeze(1)  # (B, 1, d)

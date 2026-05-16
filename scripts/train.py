@@ -370,6 +370,7 @@ def main() -> None:
         ffn_mult=mcfg_raw.get("ffn_mult", 4),
         dropout=mcfg_raw.get("dropout", 0.1),
         use_type_grad_isolation=bool(mcfg_raw.get("use_type_grad_isolation", False)),
+        use_slot_id_embed=bool(mcfg_raw.get("use_slot_id_embed", False)),
     )
     model = SceneDenoiser(dcfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -425,6 +426,7 @@ def main() -> None:
         scale=float(lcfg.get("scale", 0.5)),
         type_ce=float(lcfg.get("type_ce", 0.1)),
         presence_bce=float(lcfg.get("presence_bce", 0.05)),
+        slot_diversity=float(lcfg.get("slot_diversity", 0.0)),
     )
     # class_weights: inverse-frequency per-class weights for type cross-entropy.
     # Read from training.class_weights as a list of floats in the YAML.

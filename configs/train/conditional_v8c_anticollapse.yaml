@@ -1,0 +1,99 @@
+# Training configuration: conditional_v8c_anticollapse -- Anti-Collapse 49M Smoke Test
+#
+# Week 5, Phase A (smoke). Tests 5 anti-collapse interventions targeting the
+# failure mode diagnosed in v8b: all slots collapsing to the same position.
+#
+# v8b diagnosis (from artifacts/v8b_diagnosis.md):
+#   - Interpenetration 66% at step 10k -> 100% at step 100k (worsening)
+#   - Loss plateaued at step ~75k with negligible further descent
+#   - Root cause: from-scratch 49M transformer learns to copy all slot tokens
+#     to the same representation mode; no warm-init geometry prior.
+#
+# 5 Anti-Collapse Interventions:
+#   1. use_slot_id_embed: true  -- learnable per-slot position embedding
+#      (orthogonal init) breaks permutation symmetry before transformer.
+#   2. loss.slot_diversity: 0.05 -- penalises high cosine similarity between
+#      predicted XYZ noise across slots; repels slots apart in gradient space.
+#   3. dropout: 0.15  -- increased from 0.1 to reduce memorization of the
+#      same noise trajectory per slot.
+#   4. Lower LR + longer warmup: lr=5e-5, warmup_steps=10000 -- prevents
+#      rapid collapse to a single mode in the first 5k steps.
+#   5. presence_bce weight: 2.0 -- upweighted to aggressively suppress
+#      ghost objects (all-12-slots-present mode that saturates interpenetration).
+#
+# Architecture: identical to v8b (n_layers=16, d_model=384, ~49M params)
+# plus slot_id_embed adds N_MAX * d_model = 12*384 = 4608 params (negligible).
+#
+# Training: from scratch. If smoke (2000 steps) shows <80% interpenetration
+# rejection AND diversity loss decreasing, proceed to full 200k run.
+#
+# Usage (smoke test on pod):
+#   PYTHONPATH=/workspace/Demiurge/src python3 -u scripts/train.py \
+#     --config configs/train/conditional_v8c_anticollapse.yaml \
+#     --override training.max_steps=2000 \
+#     --seed 42 2>&1 | tee logs/v8c_ac_smoke.log
+
+text_conditioning: true
+
+model:
+  n_layers: 16
+  d_model: 384
+  n_heads: 6
+  ffn_mult: 4
+  dropout: 0.15                  # [AC-3] raised from 0.1 to reduce slot copying
+  use_type_grad_isolation: true
+  use_slot_id_embed: true        # [AC-1] orthogonal per-slot embedding
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  batch_size: 64
+  lr: 5.0e-5                     # [AC-4] lower LR: 5e-5 vs v8b's 1.5e-4
+  warmup_steps: 10000            # [AC-4] longer warmup: 10k vs v8b's 5k
+  max_steps: 200000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 10000
+  val_every_epochs: 999999
+  val_n_scenes: 0
+  dtype: "float32"
+  use_class_balanced_sampler: true
+  weighted_sampling: false
+  class_weights: [0.508274, 0.509557, 0.524349, 0.610689, 0.576833, 0.614267, 0.649812, 0.540713, 0.785170, 0.674344, 0.658182, 0.717809, 5.630001]
+
+  cfg_dropout: 0.15
+  use_discrete_type_diffusion: true
+
+  log_every_steps: 10
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 1.0
+  presence_bce: 2.0              # [AC-5] upweighted: 2.0 vs v8b's 1.0
+  slot_diversity: 0.05           # [AC-2] pairwise XYZ cosine repulsion
+
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+output:
+  dir: "checkpoints/conditional_v8c_anticollapse"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v8c_anticollapse"
+  name: "conditional_v8c_anticollapse"
+  tags: ["model", "week5", "conditional", "d384", "v8c", "49M",
+         "anti-collapse", "slot-id-embed", "diversity-loss", "from-scratch",
+         "smoke-test"]
