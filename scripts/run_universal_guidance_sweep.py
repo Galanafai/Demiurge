@@ -31,14 +31,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from data.reader import ShardReader
 from guidance.energy import pairwise_overlap_energy
-from model.denoiser import DenoiserConfig, SceneDenoiser
+from model.denoiser import DenoiserConfig, SceneDenoiser, N_MAX
 from model.rotations import rot6d_to_quat_wxyz
 from model.schedule import CosineSchedule, DDIMSampler
 from scene.schema import SceneTensor, WorkspaceBounds
 from validator.core import SceneValidator
 
 DDIM_STEPS = 50
-N_MAX = 8
+
 
 
 # ---------------------------------------------------------------------------
@@ -161,15 +161,14 @@ def run_config(
                 ec, lc = _fn_c(x_t, tids, t)
                 return eu + _s * (ec - eu), lc
 
-        with torch.no_grad():
-            x_cont, type_ids = sampler.sample_with_universal_guidance(
-                fn,
-                (n_per_prompt, N_MAX, 13),
-                seed=per_prompt_seed,
-                device=device,
-                type_init="uniform",
-                guidance_scale=guidance_scale,
-            )
+        x_cont, type_ids = sampler.sample_with_universal_guidance(
+            fn,
+            (n_per_prompt, N_MAX, 13),
+            seed=per_prompt_seed,
+            device=device,
+            type_init="uniform",
+            guidance_scale=guidance_scale,
+        )
 
         for s_idx in range(n_per_prompt):
             st_norm = decode_scene(x_cont[s_idx], type_ids[s_idx], bounds)

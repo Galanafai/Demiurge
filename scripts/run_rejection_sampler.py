@@ -29,14 +29,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from data.reader import ShardReader
-from model.denoiser import DenoiserConfig, SceneDenoiser
+from model.denoiser import DenoiserConfig, SceneDenoiser, N_MAX
 from model.rotations import rot6d_to_quat_wxyz
 from model.schedule import CosineSchedule, DDIMSampler
 from scene.schema import SceneTensor, WorkspaceBounds
 from validator.core import SceneValidator
 
 DDIM_STEPS = 50
-N_MAX = 8
+
 
 
 def load_model(ckpt_path: Path, device: torch.device) -> SceneDenoiser:
