@@ -1,0 +1,80 @@
+# Training configuration: conditional_v8b -- 49M Parameter Scaling Test
+#
+# Week 4, Phase E-prime. v8 (25M) was miscalculated from the task's 57M estimate.
+# v8b uses n_layers=16, d_model=384 to hit the ~49M literature threshold.
+#
+# Verified param count: 48.65M (closest to 50M without exceeding VRAM budget)
+# Compare: v7=8.89M, v8=25.00M (2.8x), v8b=48.65M (5.5x v7)
+#
+# Architecture vs v7:
+#   d_model: 256 -> 384  (+50% width)
+#   n_layers: 6 -> 16    (+167% depth)
+#   n_heads: 8 -> 6      (head_dim: 32 -> 64)
+#
+# All v7 fixes inherited. From-scratch training.
+# LR schedule identical to v8: 1.5e-4 peak, 5000 warmup steps.
+
+text_conditioning: true
+
+model:
+  n_layers: 16
+  d_model: 384
+  n_heads: 6
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: true
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  batch_size: 64
+  lr: 1.5e-4
+  lr_min: 1.0e-6
+  warmup_steps: 5000
+  max_steps: 150000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 10000
+  val_every_epochs: 999999
+  val_n_scenes: 0
+  dtype: "float32"
+  use_class_balanced_sampler: true
+  weighted_sampling: false
+  class_weights: [0.508274, 0.509557, 0.524349, 0.610689, 0.576833, 0.614267, 0.649812, 0.540713, 0.785170, 0.674344, 0.658182, 0.717809, 5.630001]
+
+  cfg_dropout: 0.15
+
+  use_discrete_type_diffusion: true
+
+  log_every_steps: 10
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 1.0
+  presence_bce: 1.0
+
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+output:
+  dir: "checkpoints/conditional_v8b"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v8b"
+  name: "conditional_v8b"
+  tags: ["model", "week4", "conditional", "d384", "v8b", "scaled", "49M",
+         "cfg-dropout", "discrete-type-diffusion", "type-grad-isolation", "from-scratch",
+         "n_layers16"]
