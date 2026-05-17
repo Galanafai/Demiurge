@@ -202,9 +202,9 @@ def _worker_validate(args: tuple) -> tuple[int, bool, float | None]:
     )
     try:
         report = val.validate(sc)
-        return idx, bool(report.accepted), getattr(report, "rrt_plan_length", None)
+        return idx, bool(report.accepted)
     except Exception:
-        return idx, False, None
+        return idx, False
 
 
 def parallel_validate(
@@ -228,13 +228,13 @@ def parallel_validate(
         )
         for i, s in enumerate(scenes)
     ]
-    results: list[tuple[bool, float | None]] = [(False, None)] * len(scenes)
+    results: list[bool] = [False] * len(scenes)
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futs = {pool.submit(_worker_validate, a): a[0] for a in args_list}
         for fut in as_completed(futs):
             try:
-                idx, accepted, plan_len = fut.result()
-                results[idx] = (accepted, plan_len)
+                idx, accepted = fut.result()
+                results[idx] = accepted
             except Exception:
                 pass
     return results
@@ -307,7 +307,7 @@ def evaluate_sampler(
     n_flat = len(flat)
     print(f"  Generation done ({n_flat} scenes). Validating with {n_drake_workers} workers ...")
     flat_results = parallel_validate(flat, rrt_budget, n_drake_workers)
-    # flat_results[i] = (accepted, rrt_plan_length | None)
+    # flat_results[i] = accepted (bool)
 
     # ---- REASSEMBLE --------------------------------------------------------
     scenes_all: list[SceneTensor] = []
@@ -317,7 +317,7 @@ def evaluate_sampler(
     for g, desc in enumerate(prompts_per_group):
         g_idxs = [j for j, gi in enumerate(group_idx) if gi == g]
         g_scenes = [flat[j] for j in g_idxs]
-        g_accepted = [flat_results[j][0] for j in g_idxs]
+        g_accepted = [flat_results[j] for j in g_idxs]
 
         if is_rejection:
             valid = [s for s, a in zip(g_scenes, g_accepted) if a]
@@ -335,15 +335,6 @@ def evaluate_sampler(
     # ---- METRICS -----------------------------------------------------------
     val_rate = sum(accepted_all) / max(len(accepted_all), 1)
     div = diversity(scenes_all)
-
-    # RRT plan lengths from parallel_validate results (if available)
-    plan_lens = [
-        flat_results[j][1]
-        for j in range(n_flat)
-        if flat_results[j][0] and flat_results[j][1] is not None
-    ]
-    downstream_success = len(plan_lens) / max(n_flat, 1)
-    mean_plan_len = float(sum(plan_lens) / len(plan_lens)) if plan_lens else 0.0
 
     elapsed = time.monotonic() - t0
 
@@ -366,9 +357,6 @@ def evaluate_sampler(
         "n_scenes": len(scenes_all),
         "validity_rate": val_rate,
         "diversity": div,
-        "downstream_success_rate": downstream_success,
-        "mean_plan_length": mean_plan_len,
-        "mean_planning_time_s": rrt_budget,
         "elapsed_s": elapsed,
         "scene_records": scene_records,
     }

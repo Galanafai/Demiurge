@@ -35,10 +35,8 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
 
 
 METRICS = [
-    ("validity_rate",          "Validity (%)",          100.0),
-    ("diversity",              "Diversity",              1.0),
-    ("downstream_success_rate","Downstream RRT (%)",    100.0),
-    ("mean_plan_length",       "Plan Length (waypoints)",1.0),
+    ("validity_rate", "Validity (%)", 100.0),
+    ("diversity",     "Diversity",    1.0),
 ]
 
 # Display order for samplers
@@ -47,7 +45,7 @@ SAMPLER_ORDER = [
     "v7_cond_baseline",
     "v7_rejection",
     "v7_ug_best",
-    "v8c_warminit_cond",
+    "v7_ug_scale1",
 ]
 
 
@@ -128,8 +126,7 @@ def main() -> None:
         "# Demiurge Week 5: Evaluation Results",
         "",
         "Metrics are mean +/- std across seeds. "
-        "Bold = best in column. "
-        "Validity and Downstream RRT shown as percentages.",
+        "Bold = best in column. Validity shown as percentage.",
         "",
         "\n".join(rows),
         "",
@@ -138,8 +135,8 @@ def main() -> None:
         "- `v7_uncond`: conditional_v7, CFG=0 (unconditional baseline)",
         "- `v7_cond_baseline`: conditional_v7, CFG=1.0, no Universal Guidance",
         "- `v7_rejection`: v7 conditioned, rejection sampling (generate 4x, keep valid)",
-        "- `v7_ug_best`: v7 conditioned with Universal Guidance at best scale from sweep",
-        "- `v8c_warminit_cond`: v8c_warminit conditioned, CFG=1.0 (architectural comparison)",
+        "- `v7_ug_best`: v7 conditioned with Universal Guidance, scale=0.5 (best from sweep)",
+        "- `v7_ug_scale1`: v7 conditioned with Universal Guidance, scale=1.0",
     ]
 
     content = "\n".join(lines) + "\n"
