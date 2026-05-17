@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
 import sys
 import time
 from collections import defaultdict
@@ -40,6 +41,26 @@ from validator.core import SceneValidator
 DDIM_STEPS = 50
 
 
+# ---------------------------------------------------------------------------
+# Worker initialiser for multiprocessing validation pool
+# ---------------------------------------------------------------------------
+
+_worker_validator: SceneValidator | None = None
+
+
+def _pool_init(rrt_budget_s: float) -> None:
+    """Initialise a SceneValidator in each pool worker (once per process)."""
+    global _worker_validator
+    _worker_validator = SceneValidator(
+        workspace_bounds=WorkspaceBounds.default(),
+        rrt_budget_s=rrt_budget_s,
+    )
+
+
+def _pool_validate(st_phys: SceneTensor) -> object:
+    """Validate a single physical SceneTensor in a worker process."""
+    assert _worker_validator is not None
+    return _worker_validator.validate(st_phys)
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -121,13 +142,14 @@ def run_config(
     sampler: DDIMSampler,
     held_out: list[dict],
     text_cache: dict[str, torch.Tensor],
-    validator: SceneValidator,
+    rrt_budget: float,
     bounds: WorkspaceBounds,
     device: torch.device,
     cfg_scale: float,
     guidance_scale: float,
     n_per_prompt: int,
     seed: int,
+    drake_workers: int = 1,
 ) -> dict:
     """Run one (guidance_scale, seed) config and return metrics."""
     t0 = time.monotonic()
@@ -137,6 +159,20 @@ def run_config(
     scene_positions: list[torch.Tensor] = []
     all_energies: list[float] = []
     records: list[dict] = []
+
+    pool: multiprocessing.pool.Pool | None = None
+    if drake_workers > 1:
+        pool = multiprocessing.Pool(
+            processes=drake_workers,
+            initializer=_pool_init,
+            initargs=(rrt_budget,),
+        )
+    else:
+        # Single-process: use a plain validator kept alive for the whole config.
+        _validator = SceneValidator(
+            workspace_bounds=WorkspaceBounds.default(),
+            rrt_budget_s=rrt_budget,
+        )
 
     for d_idx, desc_info in enumerate(held_out):
         desc = desc_info["description"]
@@ -170,10 +206,21 @@ def run_config(
             guidance_scale=guidance_scale,
         )
 
+        decoded: list[SceneTensor] = []
+        phys_scenes: list[SceneTensor] = []
         for s_idx in range(n_per_prompt):
             st_norm = decode_scene(x_cont[s_idx], type_ids[s_idx], bounds)
             st_phys = st_norm.denormalize(bounds)
+            decoded.append(st_norm)
+            phys_scenes.append(st_phys)
 
+        # Validate: parallel or serial
+        if pool is not None:
+            reports = pool.map(_pool_validate, phys_scenes)
+        else:
+            reports = [_validator.validate(st_phys) for st_phys in phys_scenes]
+
+        for s_idx, (st_norm, rpt) in enumerate(zip(decoded, reports)):
             pres = st_norm.presence.bool()
             if not pres.any():
                 n_empty += 1
@@ -186,7 +233,6 @@ def run_config(
                 e = pairwise_overlap_energy(xi, ti).item()
                 all_energies.append(e)
 
-            rpt = validator.validate(st_phys)
             drake_total += 1
             if rpt.accepted:
                 drake_accepted += 1
@@ -197,7 +243,7 @@ def run_config(
                 "sample_idx": s_idx,
                 "drake_accepted": rpt.accepted,
                 "energy": all_energies[-1] if all_energies else 0.0,
-                "n_present": int(pres.sum().item()) if not (not pres.any()) else 0,
+                "n_present": int(pres.sum().item()) if pres.any() else 0,
                 "type_ids": type_ids[s_idx].cpu().tolist(),
             })
 
@@ -213,6 +259,10 @@ def run_config(
     diversity = compute_diversity(scene_positions)
     mean_energy = sum(all_energies) / max(1, len(all_energies))
     elapsed = time.monotonic() - t0
+
+    if pool is not None:
+        pool.terminate()
+        pool.join()
 
     return {
         "guidance_scale": guidance_scale,
@@ -284,6 +334,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-prompts", type=int, default=200)
     p.add_argument("--n-per-prompt", type=int, default=5)
     p.add_argument("--rrt-budget", type=float, default=2.0)
+    p.add_argument("--drake-workers", type=int, default=1,
+                   help="Drake validation worker processes per config (default 1).")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--data-dir", default="data/v1")
     p.add_argument("--budget-cap", type=float, default=8.0,
@@ -304,7 +356,6 @@ def main() -> None:
     schedule = CosineSchedule(T=1000)
     sampler = DDIMSampler(schedule, n_steps=DDIM_STEPS)
     bounds = WorkspaceBounds.default()
-    validator = SceneValidator(rrt_budget_s=args.rrt_budget)
 
     data_dir = Path(args.data_dir)
     held_out = build_held_out(data_dir, args.n_prompts)
@@ -336,13 +387,14 @@ def main() -> None:
                 sampler=sampler,
                 held_out=held_out,
                 text_cache=text_cache,
-                validator=validator,
+                rrt_budget=args.rrt_budget,
                 bounds=bounds,
                 device=device,
                 cfg_scale=args.cfg_scale,
                 guidance_scale=guidance_scale,
                 n_per_prompt=args.n_per_prompt,
                 seed=seed,
+                drake_workers=args.drake_workers,
             )
 
             # Save full record per run
