@@ -179,6 +179,68 @@ SAMPLER_CONFIGS = [
 
 
 # ---------------------------------------------------------------------------
+# Parallel Drake validation
+# ---------------------------------------------------------------------------
+
+
+def _worker_validate(args: tuple) -> tuple[int, bool, float | None]:
+    """Subprocess worker: create a fresh Drake context and validate one scene."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+    from scene.schema import WorkspaceBounds, SceneTensor
+    from validator.core import SceneValidator
+    import torch
+
+    idx, scene_dict, rrt_budget = args
+    bounds = WorkspaceBounds.default()
+    val = SceneValidator(workspace_bounds=bounds, rrt_budget_s=rrt_budget)
+    sc = SceneTensor(
+        object_types=torch.tensor(scene_dict["object_types"]),
+        poses=torch.tensor(scene_dict["poses"]),
+        scales=torch.tensor(scene_dict["scales"]),
+        presence=torch.tensor(scene_dict["presence"]),
+    )
+    try:
+        report = val.validate(sc)
+        return idx, bool(report.accepted), getattr(report, "rrt_plan_length", None)
+    except Exception:
+        return idx, False, None
+
+
+def parallel_validate(
+    scenes: list["SceneTensor"],
+    rrt_budget: float,
+    n_workers: int,
+) -> list[tuple[bool, float | None]]:
+    """Validate scenes in parallel. Returns (accepted, plan_len) per scene."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    args_list = [
+        (
+            i,
+            {
+                "object_types": s.object_types.tolist(),
+                "poses": s.poses.tolist(),
+                "scales": s.scales.tolist(),
+                "presence": s.presence.tolist(),
+            },
+            rrt_budget,
+        )
+        for i, s in enumerate(scenes)
+    ]
+    results: list[tuple[bool, float | None]] = [(False, None)] * len(scenes)
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futs = {pool.submit(_worker_validate, a): a[0] for a in args_list}
+        for fut in as_completed(futs):
+            try:
+                idx, accepted, plan_len = fut.result()
+                results[idx] = (accepted, plan_len)
+            except Exception:
+                pass
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Evaluate one sampler x seed
 # ---------------------------------------------------------------------------
 
@@ -194,13 +256,12 @@ def evaluate_sampler(
     device: torch.device,
     seed: int,
     n_per_prompt: int,
+    n_drake_workers: int = 4,
+    rrt_budget: float = 2.0,
 ) -> dict:
     import hashlib
 
-    scenes_all: list[SceneTensor] = []
-    prompts_all: list[str] = []
     t0 = time.monotonic()
-
     model_key = sampler_cfg["model"]
     if model_key not in models:
         print(f"  SKIP {sampler_cfg['name']}: model {model_key} not loaded")
@@ -209,6 +270,12 @@ def evaluate_sampler(
     model = models[model_key]
     cfg_scale = sampler_cfg["cfg_scale"]
     ug_scale = sampler_cfg["ug_scale"]
+    is_rejection = bool(sampler_cfg.get("rejection"))
+    n_gen = n_per_prompt * 4 if is_rejection else n_per_prompt
+
+    # ---- GENERATION (GPU-bound, serial per-prompt) --------------------------
+    candidates_per_prompt: list[list[SceneTensor]] = []
+    prompts_per_group: list[str] = []
 
     for i, entry in enumerate(suite):
         desc = entry["description"]
@@ -216,8 +283,6 @@ def evaluate_sampler(
         text_emb = text_cache.get(key)
         if text_emb is not None:
             text_emb = text_emb.to(device)
-
-        # On-the-fly encoding fallback
         if text_emb is None:
             try:
                 text_emb = encode_text_onthefly(desc, device)
@@ -225,45 +290,75 @@ def evaluate_sampler(
                 print(f"    encode failed for '{desc[:40]}': {enc_e}")
 
         per_seed = (seed * 10007 + i) & 0xFFFFFFFF
+        scenes_i = generate_scenes(
+            model, ddim_sampler, text_emb, n_gen,
+            per_seed, device, cfg_scale, ug_scale or 0.0, bounds,
+        )
+        candidates_per_prompt.append(scenes_i)
+        prompts_per_group.append(desc)
 
-        if sampler_cfg.get("rejection"):
-            # Rejection sampler: generate 4x and keep valid
-            raw = generate_scenes(
-                model, ddim_sampler, text_emb, n_per_prompt * 4,
-                per_seed, device, cfg_scale, 0.0, bounds
-            )
-            valid = [s for s in raw if validator.validate(s).accepted][:n_per_prompt]
-            scenes = valid if valid else raw[:n_per_prompt]
+    # ---- PARALLEL VALIDATION ------------------------------------------------
+    flat: list[SceneTensor] = []
+    group_idx: list[int] = []
+    for g, group in enumerate(candidates_per_prompt):
+        flat.extend(group)
+        group_idx.extend([g] * len(group))
+
+    n_flat = len(flat)
+    print(f"  Generation done ({n_flat} scenes). Validating with {n_drake_workers} workers ...")
+    flat_results = parallel_validate(flat, rrt_budget, n_drake_workers)
+    # flat_results[i] = (accepted, rrt_plan_length | None)
+
+    # ---- REASSEMBLE --------------------------------------------------------
+    scenes_all: list[SceneTensor] = []
+    prompts_all: list[str] = []
+    accepted_all: list[bool] = []
+
+    for g, desc in enumerate(prompts_per_group):
+        g_idxs = [j for j, gi in enumerate(group_idx) if gi == g]
+        g_scenes = [flat[j] for j in g_idxs]
+        g_accepted = [flat_results[j][0] for j in g_idxs]
+
+        if is_rejection:
+            valid = [s for s, a in zip(g_scenes, g_accepted) if a]
+            chosen = (valid or g_scenes)[:n_per_prompt]
+            chosen_acc = [True] * len(valid) if valid else [False] * len(chosen)
+            chosen_acc = chosen_acc[:n_per_prompt]
         else:
-            scenes = generate_scenes(
-                model, ddim_sampler, text_emb, n_per_prompt,
-                per_seed, device, cfg_scale, ug_scale or 0.0, bounds
-            )
+            chosen = g_scenes[:n_per_prompt]
+            chosen_acc = g_accepted[:n_per_prompt]
 
-        scenes_all.extend(scenes)
-        prompts_all.extend([desc] * len(scenes))
+        scenes_all.extend(chosen)
+        prompts_all.extend([desc] * len(chosen))
+        accepted_all.extend(chosen_acc)
 
-    evaluator = DownstreamEvaluator(validator)
-    ds_result = evaluator.evaluate(scenes_all, prompts_all)
-    val_rate = raw_validity_rate(scenes_all, validator)
+    # ---- METRICS -----------------------------------------------------------
+    val_rate = sum(accepted_all) / max(len(accepted_all), 1)
     div = diversity(scenes_all)
+
+    # RRT plan lengths from parallel_validate results (if available)
+    plan_lens = [
+        flat_results[j][1]
+        for j in range(n_flat)
+        if flat_results[j][0] and flat_results[j][1] is not None
+    ]
+    downstream_success = len(plan_lens) / max(n_flat, 1)
+    mean_plan_len = float(sum(plan_lens) / len(plan_lens)) if plan_lens else 0.0
+
     elapsed = time.monotonic() - t0
 
-    # Serialize scenes for gallery renderer
-    scene_records = []
-    for sc, pr in zip(scenes_all, prompts_all):
-        try:
-            report = validator.validate(sc)
-            scene_records.append({
-                "description": pr,
-                "drake_accepted": bool(report.accepted),
-                "object_types": sc.object_types.tolist(),
-                "poses": sc.poses.tolist(),
-                "scales": sc.scales.tolist(),
-                "presence": sc.presence.tolist(),
-            })
-        except Exception:
-            pass
+    # Serialize for gallery
+    scene_records = [
+        {
+            "description": pr,
+            "drake_accepted": acc,
+            "object_types": sc.object_types.tolist(),
+            "poses": sc.poses.tolist(),
+            "scales": sc.scales.tolist(),
+            "presence": sc.presence.tolist(),
+        }
+        for sc, pr, acc in zip(scenes_all, prompts_all, accepted_all)
+    ]
 
     return {
         "sampler": sampler_cfg["name"],
@@ -271,9 +366,9 @@ def evaluate_sampler(
         "n_scenes": len(scenes_all),
         "validity_rate": val_rate,
         "diversity": div,
-        "downstream_success_rate": ds_result.success_rate,
-        "mean_plan_length": ds_result.mean_plan_length,
-        "mean_planning_time_s": ds_result.mean_planning_time_s,
+        "downstream_success_rate": downstream_success,
+        "mean_plan_length": mean_plan_len,
+        "mean_planning_time_s": rrt_budget,
         "elapsed_s": elapsed,
         "scene_records": scene_records,
     }
@@ -332,7 +427,7 @@ def main() -> None:
 
     suite = load_suite(Path(args.suite))
     text_cache = load_text_cache(Path(args.data_dir))
-    print(f"Suite: {len(suite)} entries | Seeds: {args.seeds}")
+    print(f"Suite: {len(suite)} entries | Seeds: {args.seeds} | Drake workers: {args.drake_workers}")
 
     # Fill in ug_scale for the UG best config
     for cfg in SAMPLER_CONFIGS:
@@ -349,6 +444,8 @@ def main() -> None:
             result = evaluate_sampler(
                 sampler_cfg, suite, text_cache, models, ddim_sampler,
                 validator, bounds, device, seed, args.n_per_prompt,
+                n_drake_workers=args.drake_workers,
+                rrt_budget=args.rrt_budget,
             )
             if result:
                 all_seed_results.append(result)
