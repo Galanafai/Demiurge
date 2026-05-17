@@ -160,7 +160,8 @@ def _capture_by_manual_loop(
             eps_pred, type_logits = fn(x_t, type_ids, t_batch)
 
             # Tweedie estimate of x_0 using schedule.alpha_bar(Tensor)
-            ab_t = schedule.alpha_bar(t_batch)  # (1,) or scalar Tensor
+            # alpha_bar stores its table on CPU; move result to device explicitly.
+            ab_t = schedule.alpha_bar(t_batch).to(device)
             x_0_hat = (x_t - (1.0 - ab_t).sqrt() * eps_pred) / ab_t.sqrt()
 
             # Universal Guidance gradient (active only in middle steps)
@@ -184,7 +185,7 @@ def _capture_by_manual_loop(
             if step_idx < DDIM_STEPS - 1:
                 t_prev = step_indices[step_idx + 1]
                 t_prev_batch = t_prev.expand(1).to(device)
-                ab_prev = schedule.alpha_bar(t_prev_batch)
+                ab_prev = schedule.alpha_bar(t_prev_batch).to(device)
                 x_t = ab_prev.sqrt() * x_0_hat + (1.0 - ab_prev).sqrt() * eps_pred
             # else: final step, x_t not needed
 
