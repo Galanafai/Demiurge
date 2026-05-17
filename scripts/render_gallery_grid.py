@@ -115,23 +115,29 @@ def _generate_synthetic_tiles(
     n: int,
     seed: int,
 ) -> list[tuple[SceneTensor, str, bool]]:
-    """Generate synthetic tiles for when eval JSON has no scene_records.
+    """Generate synthetic tiles when eval JSON has no scene_records.
 
-    Uses ProceduralSampler to produce physically plausible scenes.
+    Uses ProceduralSampler + generate_description to produce physically
+    plausible scenes with real task descriptions.
     """
-    from data.sampler import ProceduralSampler
+    import numpy as np
     from data.descriptions import generate_description
+    from data.sampler import ProceduralSampler
 
     sampler = ProceduralSampler(seed=seed)
+    rng_np = np.random.default_rng(seed)
     tiles = []
-    rng = random.Random(seed)
+    rng_valid = random.Random(seed)
 
     for i in range(n):
         candidate = sampler.sample()
         scene = candidate.scene
-        prompt = candidate.description or f"Tabletop task scene {i}"
+        try:
+            prompt = generate_description(candidate, rng_np)
+        except Exception:
+            prompt = f"Tabletop task scene {i}"
         # Mark validity unknown (no Drake call here to keep it fast)
-        valid = rng.random() > 0.85  # rough prior from v7 uncond rate
+        valid = rng_valid.random() > 0.85  # rough prior from v7 uncond rate
         tiles.append((scene, prompt, valid))
     return tiles
 

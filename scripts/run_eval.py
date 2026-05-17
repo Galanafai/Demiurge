@@ -137,9 +137,31 @@ def load_suite(suite_path: Path) -> list[dict]:
 
 
 def load_text_cache(data_dir: Path) -> dict[str, torch.Tensor]:
-    import hashlib
-    raw = torch.load(data_dir / "text_embeddings.pt", weights_only=True)
+    """Load pre-cached text embeddings if available; return empty dict otherwise.
+
+    The caller falls back to on-the-fly encoding via TextEncoder when a key
+    is missing from the cache.
+    """
+    pt_path = data_dir / "text_embeddings.pt"
+    if not pt_path.exists():
+        print(f"  text_embeddings.pt not found at {pt_path} - will encode on the fly")
+        return {}
+    raw = torch.load(pt_path, weights_only=True)
     return {k: v.float().cpu() for k, v in raw.items()}
+
+
+_text_encoder = None  # lazy singleton
+
+
+def encode_text_onthefly(text: str, device: torch.device) -> torch.Tensor:
+    """Encode a prompt on the fly via TextEncoder (singleton)."""
+    global _text_encoder
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+    from model.text_encoder import TextEncoder
+    if _text_encoder is None:
+        _text_encoder = TextEncoder()
+    return _text_encoder.encode(text).to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +174,7 @@ SAMPLER_CONFIGS = [
     {"name": "v7_cond_baseline", "model": "v7", "cfg_scale": 1.0, "ug_scale": 0.0},
     {"name": "v7_rejection",     "model": "v7", "cfg_scale": 1.0, "ug_scale": 0.0, "rejection": True},
     {"name": "v7_ug_best",       "model": "v7", "cfg_scale": 1.0, "ug_scale": None},  # filled from --ug-scale
-    {"name": "v8c_warminit_cond","model": "v8c","cfg_scale": 1.0, "ug_scale": 0.0},
+    {"name": "v7_ug_scale1",     "model": "v7", "cfg_scale": 1.0, "ug_scale": 1.0},
 ]
 
 
@@ -195,6 +217,13 @@ def evaluate_sampler(
         if text_emb is not None:
             text_emb = text_emb.to(device)
 
+        # On-the-fly encoding fallback
+        if text_emb is None:
+            try:
+                text_emb = encode_text_onthefly(desc, device)
+            except Exception as enc_e:
+                print(f"    encode failed for '{desc[:40]}': {enc_e}")
+
         per_seed = (seed * 10007 + i) & 0xFFFFFFFF
 
         if sampler_cfg.get("rejection"):
@@ -220,6 +249,22 @@ def evaluate_sampler(
     div = diversity(scenes_all)
     elapsed = time.monotonic() - t0
 
+    # Serialize scenes for gallery renderer
+    scene_records = []
+    for sc, pr in zip(scenes_all, prompts_all):
+        try:
+            report = validator.validate(sc)
+            scene_records.append({
+                "description": pr,
+                "drake_accepted": bool(report.accepted),
+                "object_types": sc.object_types.tolist(),
+                "poses": sc.poses.tolist(),
+                "scales": sc.scales.tolist(),
+                "presence": sc.presence.tolist(),
+            })
+        except Exception:
+            pass
+
     return {
         "sampler": sampler_cfg["name"],
         "seed": seed,
@@ -230,6 +275,7 @@ def evaluate_sampler(
         "mean_plan_length": ds_result.mean_plan_length,
         "mean_planning_time_s": ds_result.mean_planning_time_s,
         "elapsed_s": elapsed,
+        "scene_records": scene_records,
     }
 
 
