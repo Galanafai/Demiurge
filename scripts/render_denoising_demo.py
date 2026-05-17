@@ -166,9 +166,10 @@ def _capture_by_manual_loop(
 
             # Universal Guidance gradient (active only in middle steps)
             if ug_scale > 0.0 and guidance_min <= step_idx <= guidance_max:
-                x_0_hat_g = x_0_hat.detach().requires_grad_(True)
-                energy = pairwise_overlap_energy(x_0_hat_g, type_ids).sum()
-                grad = torch.autograd.grad(energy, x_0_hat_g)[0]
+                with torch.enable_grad():
+                    x_0_hat_g = x_0_hat.detach().requires_grad_(True)
+                    energy = pairwise_overlap_energy(x_0_hat_g, type_ids).sum()
+                    grad = torch.autograd.grad(energy, x_0_hat_g)[0]
                 # Correct eps: eps_guided = eps + ug_scale * sqrt(1-ab) * grad
                 eps_pred = eps_pred + ug_scale * (1.0 - ab_t).sqrt() * grad.detach()
                 # Recompute x_0_hat with guided eps

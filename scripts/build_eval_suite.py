@@ -44,30 +44,39 @@ def parse_args() -> argparse.Namespace:
 
 
 def collect_held_out(data_dir: Path, n_prompts: int, seed: int) -> list[dict]:
-    """Collect unique descriptions from data/v1 stratified by template family.
+    """Collect unique task descriptions, stratified by template family.
 
-    Uses the last 100 scenes per template as the held-out split (same
-    convention as run_universal_guidance_sweep.py). Deduplicates by
-    description SHA256 prefix to avoid near-duplicate prompts.
+    First attempts to draw from the last 100 scenes per template in data_dir
+    (ShardReader). If fewer than n_prompts unique descriptions are available
+    there, supplements by drawing from ProceduralSampler directly until
+    n_prompts are collected.
     """
     import torch
+    from data.sampler import ProceduralSampler
 
     per_template: dict[str, list[dict]] = defaultdict(list)
-    for scene, desc, report, _ in ShardReader(data_dir):
-        tmpl = report.get("task_family", "unknown")
-        per_template[tmpl].append({"description": desc, "template": tmpl})
+    try:
+        for scene, desc, report, _ in ShardReader(data_dir):
+            if not desc:
+                continue
+            tmpl = report.get("task_family", "default") if isinstance(report, dict) else "default"
+            per_template[tmpl].append({"description": desc, "template": tmpl})
+    except Exception as e:
+        print(f"  ShardReader warning: {e}", file=sys.stderr)
 
-    total = sum(len(v) for v in per_template.values())
     rng = torch.Generator()
     rng.manual_seed(seed)
 
     sampled: list[dict] = []
-    for tmpl in sorted(per_template):
-        items = per_template[tmpl][-100:]  # held-out tail
-        n_take = max(1, round(n_prompts * len(items) / total))
-        idxs = torch.randperm(len(items), generator=rng).tolist()[:n_take]
-        sampled.extend(items[i] for i in idxs)
+    if per_template:
+        total = sum(len(v) for v in per_template.values())
+        for tmpl in sorted(per_template):
+            items = per_template[tmpl][-100:]  # held-out tail
+            n_take = max(1, round(n_prompts * len(items) / total))
+            idxs = torch.randperm(len(items), generator=rng).tolist()[:n_take]
+            sampled.extend(items[i] for i in idxs)
 
+    # Deduplicate
     seen: set[str] = set()
     deduped: list[dict] = []
     for item in sampled:
@@ -77,6 +86,28 @@ def collect_held_out(data_dir: Path, n_prompts: int, seed: int) -> list[dict]:
             item["desc_id"] = key
             deduped.append(item)
 
+    # Supplement from ProceduralSampler if needed
+    if len(deduped) < n_prompts:
+        proc_seed = seed ^ 0xDEAD
+        ps = ProceduralSampler(seed=proc_seed)
+        print(f"  ShardReader yielded {len(deduped)} - supplementing with ProceduralSampler ...")
+        attempts = 0
+        while len(deduped) < n_prompts and attempts < n_prompts * 20:
+            attempts += 1
+            try:
+                cand = ps.sample()
+                desc = cand.description or ""
+                if not desc:
+                    continue
+                key = hashlib.sha256(desc.encode()).hexdigest()[:16]
+                if key not in seen:
+                    seen.add(key)
+                    tmpl = getattr(cand, "task_family", "procedural")
+                    deduped.append({"description": desc, "template": tmpl, "desc_id": key})
+            except Exception:
+                pass
+
+    print(f"  Total unique descriptions: {len(deduped[:n_prompts])}")
     return deduped[:n_prompts]
 
 
