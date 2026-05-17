@@ -88,21 +88,26 @@ def collect_held_out(data_dir: Path, n_prompts: int, seed: int) -> list[dict]:
 
     # Supplement from ProceduralSampler if needed
     if len(deduped) < n_prompts:
+        import numpy as np
+        from data.descriptions import generate_description
+        from data.sampler import ProceduralSampler
+
         proc_seed = seed ^ 0xDEAD
         ps = ProceduralSampler(seed=proc_seed)
+        rng = np.random.default_rng(proc_seed)
         print(f"  ShardReader yielded {len(deduped)} - supplementing with ProceduralSampler ...")
         attempts = 0
         while len(deduped) < n_prompts and attempts < n_prompts * 20:
             attempts += 1
             try:
                 cand = ps.sample()
-                desc = cand.description or ""
+                desc = generate_description(cand, rng)
                 if not desc:
                     continue
                 key = hashlib.sha256(desc.encode()).hexdigest()[:16]
                 if key not in seen:
                     seen.add(key)
-                    tmpl = getattr(cand, "task_family", "procedural")
+                    tmpl = str(getattr(cand, "task_family", "procedural"))
                     deduped.append({"description": desc, "template": tmpl, "desc_id": key})
             except Exception:
                 pass
