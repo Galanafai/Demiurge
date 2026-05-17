@@ -1,0 +1,96 @@
+# Training configuration: conditional_v6 -- Type Gradient Isolation
+#
+# Week 4, Phase C. Fixes the geometry degradation seen in v5 (0.5%
+# Drake validity on zeros-init vs v4's 7.5%).
+#
+# Root cause of v5 failure: gradient cross-talk. When type_ids are
+# corrupted during training, the type_embed gradient flows through all
+# 6 transformer blocks and out through head_xyz/head_rot6d/head_scale,
+# destabilising the geometry distribution learned from v4.
+#
+# Fix: use_type_grad_isolation=true in model config.
+#   - type_embed is detached before entering the transformer token stream
+#   - Geometry heads receive NO gradient from type_embed
+#   - head_type still receives gradient from type_embed via a residual
+#     injection (scene_out + type_emb_full -> head_type)
+#   - type_embed learns to predict types; transformer learns geometry
+#
+# Key differences from conditional_v5:
+#   - model.use_type_grad_isolation: true    (THE FIX)
+#   - training.warm_init_from: conditional_v4/latest.pt (NOT v5 -- v5 degraded)
+#
+# Usage (on pod):
+#   tmux new-session -d -s cond_v6 \
+#     "cd /workspace/Demiurge && source ~/.bashrc && \
+#      PYTHONPATH=/workspace/Demiurge/src python3 -u \
+#      scripts/train.py --config configs/train/conditional_v6.yaml \
+#      --seed 42 2>&1 | tee logs/cond_v6.log"
+
+text_conditioning: true
+
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: true   # Stop gradient: type_embed detached from transformer
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  batch_size: 128
+  lr: 1.0e-4
+  warmup_steps: 500
+  max_steps: 30000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000
+  val_every_epochs: 999999
+  val_n_scenes: 0
+  dtype: "float32"
+  use_class_balanced_sampler: true
+  weighted_sampling: false
+  class_weights: [0.508274, 0.509557, 0.524349, 0.610689, 0.576833, 0.614267, 0.649812, 0.540713, 0.785170, 0.674344, 0.658182, 0.717809, 0.614200]
+
+  cfg_dropout: 0.15
+
+  # Discrete type diffusion: same as v5.
+  use_discrete_type_diffusion: true
+
+  # Warm-init from V4 (NOT v5 -- v5 backbone is degraded).
+  # V4 has intact geometry; we teach it type denoising with isolation.
+  warm_init_from: checkpoints/conditional_v4/latest.pt
+  warm_init_keys: model_state
+
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+  log_every_steps: 10
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 1.0
+  presence_bce: 1.0
+
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+
+output:
+  dir: "checkpoints/conditional_v6"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v6"
+  tags: ["model", "week4", "conditional", "d256", "v6",
+         "discrete-type-diffusion", "type-grad-isolation", "warm-v4"]

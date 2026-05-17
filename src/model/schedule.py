@@ -159,6 +159,86 @@ class CosineSchedule:
 
         return (x_t - sqrt_1mab * eps_pred) / sqrt_ab.clamp(min=1e-8)
 
+    def type_corruption_prob(self, t_idx: Tensor) -> Tensor:
+        """Corruption probability for discrete type diffusion.
+
+        gamma_t = 1 - sqrt(alpha_bar_t).
+
+        At t=0, gamma=0 (no corruption -- clean type_ids preserved).
+        At t=T-1, gamma approx 1 (almost fully random types).
+        This mirrors the signal-to-noise schedule of the continuous process,
+        ensuring the denoiser sees consistent noise levels across modalities.
+
+        Args:
+            t_idx: Integer timestep indices in [0, T-1]. Shape: (B,).
+
+        Returns:
+            gamma: Float tensor of corruption probabilities. Shape: (B,).
+        """
+        ab = self.alpha_bar(t_idx)
+        return 1.0 - ab.sqrt()
+
+
+
+# ---------------------------------------------------------------------------
+# Discrete type diffusion
+# ---------------------------------------------------------------------------
+
+
+def corrupt_type_ids(
+    type_ids: Tensor,
+    t_idx: Tensor,
+    schedule: CosineSchedule,
+    n_valid_types: int = 12,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Uniform-corruption discrete diffusion for object type IDs.
+
+    Each present slot is independently replaced with a uniformly random valid
+    type with probability gamma_t = 1 - sqrt(alpha_bar_t). PAD slots
+    (type_id == n_valid_types) are never corrupted so the model cannot learn
+    to predict PAD from noise.
+
+    The corruption schedule is tied to the continuous alpha_bar schedule so
+    that at t=0 the types are clean (gamma=0) and at t=T-1 they are almost
+    fully random (gamma~=1). This ensures that during DDIM inference with
+    sample_with_types(), the type context seen at each reverse step matches
+    the distribution the model was trained on.
+
+    Args:
+        type_ids: Ground-truth integer type IDs. Shape: (B, N). Long tensor.
+        t_idx: Integer timestep indices in [0, T-1]. Shape: (B,).
+        schedule: The CosineSchedule instance used for training.
+        n_valid_types: Number of valid (non-PAD) object types. Default 12.
+            Types in [0, n_valid_types) are valid; type == n_valid_types is PAD.
+        generator: Optional RNG generator for reproducibility.
+
+    Returns:
+        Corrupted type IDs of the same shape and dtype as type_ids.
+        PAD slots retain their original value. Present slots are corrupted
+        with probability gamma_t.
+    """
+    B, N = type_ids.shape
+    device = type_ids.device
+
+    # gamma shape: (B,) -- one corruption probability per sample in the batch.
+    gamma = schedule.type_corruption_prob(t_idx).to(device)  # (B,)
+    gamma_expanded = gamma.unsqueeze(1).expand(B, N)           # (B, N)
+
+    # Bernoulli mask: True where we replace with a random type.
+    corrupt_mask = torch.bernoulli(gamma_expanded, generator=generator).bool()
+
+    # Draw replacement types uniformly from [0, n_valid_types).
+    random_types = torch.randint(
+        0, n_valid_types, (B, N), device=device, generator=generator
+    )
+
+    # Never corrupt PAD slots -- they carry structural (mask) information.
+    is_pad = type_ids >= n_valid_types
+    corrupt_mask = corrupt_mask & ~is_pad
+
+    return torch.where(corrupt_mask, random_types, type_ids)
+
 
 # ---------------------------------------------------------------------------
 # DDIM Sampler
@@ -281,6 +361,285 @@ class DDIMSampler:
             x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
 
         return x_t
+
+    @torch.no_grad()
+    def sample_with_types(
+        self,
+        fn: Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]],
+        shape: tuple[int, ...],
+        seed: int | None = None,
+        device: torch.device | str = "cpu",
+        type_init: str = "uniform",
+        n_valid_types: int = 12,
+    ) -> tuple[Tensor, Tensor]:
+        """Generate (x_cont, type_ids) jointly via DDIM reverse diffusion.
+
+        Closes the training/inference gap present in :meth:`sample`. During
+        training, the model receives clean ``type_ids`` at every step; during
+        inference with the legacy :meth:`sample`, ``type_ids`` were frozen at
+        zero (CUBE), causing type collapse. This method maintains ``type_ids``
+        state across denoising steps by updating from the model's own
+        ``head_type`` logits at each step.
+
+        Args:
+            fn: Callable returned by
+                :meth:`~model.denoiser.SceneDenoiser.conditional_sampling_fn`.
+                Signature: ``(x_t, type_ids, t) -> (eps_pred, type_logits)``
+                where ``eps_pred`` has shape ``shape`` and ``type_logits``
+                has shape ``(B, N_MAX, N_TYPE)``.
+            shape: Output shape ``(B, N_MAX, N_CONT)``. N_CONT must match
+                the model's continuous feature dimension (13).
+            seed: Optional integer seed for the initial Gaussian noise AND
+                the uniform type_ids prior. Both use the same generator so
+                the full output is reproducible from a single seed.
+            device: Device on which to run sampling.
+            type_init: How to initialise ``type_ids`` before the first step.
+                ``"uniform"`` samples uniformly from ``[0, n_valid_types)``,
+                giving each type an equal prior probability.
+                ``"zeros"`` replicates the legacy broken behavior (all CUBE)
+                and is provided only for regression comparison.
+            n_valid_types: Upper bound (exclusive) for uniform type sampling.
+                Should match the number of non-padding vocabulary entries.
+                Default 12 (types 0-11; type 12 is the PAD token).
+
+        Returns:
+            ``(x_cont, type_ids)`` where:
+              - ``x_cont``: Denoised continuous features. Shape: ``shape``.
+              - ``type_ids``: Final predicted type per slot. Shape: ``(B, N_MAX)``,
+                dtype long, values in ``[0, N_TYPE)``.
+        """
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(seed)
+        else:
+            generator = None
+
+        B = shape[0]
+        N = shape[1]
+
+        # Start from pure Gaussian noise.
+        x_t = torch.randn(shape, device=device, generator=generator)
+
+        # Initialise type_ids from prior.
+        if type_init == "uniform":
+            type_ids = torch.randint(
+                0, n_valid_types, (B, N), dtype=torch.long, device=device,
+                generator=generator,
+            )
+        elif type_init == "zeros":
+            # Replicates the legacy (broken) fixed-zero behavior.
+            type_ids = torch.zeros(B, N, dtype=torch.long, device=device)
+        else:
+            raise ValueError(
+                f"Unknown type_init {type_init!r}. Must be 'uniform' or 'zeros'."
+            )
+
+        sched = self.schedule
+
+        for i, t_val in enumerate(self._timesteps):
+            t_tensor = torch.full((B,), t_val, dtype=torch.long, device=device)
+
+            # Forward pass: get both eps and type logits.
+            eps_pred, type_logits = fn(x_t, type_ids, t_tensor)
+
+            # Mask out the PAD token (index n_valid_types and above) so argmax
+            # never selects vocabulary entries outside [0, n_valid_types).
+            # This prevents the sampler from emitting PAD-type objects at inference.
+            if n_valid_types < type_logits.shape[-1]:
+                type_logits = type_logits.clone()
+                type_logits[..., n_valid_types:] = float("-inf")
+
+            # Update type_ids from this step's logits before the continuous update.
+            # Greedy argmax: deterministic, consistent with DDIM eta=0 spirit.
+            type_ids = type_logits.argmax(dim=-1)  # (B, N_MAX)
+
+            # Standard DDIM continuous update (identical math to sample()).
+            ab_t = sched.alpha_bar(t_tensor)        # (B,)
+            if i + 1 < len(self._timesteps):
+                t_prev_val = self._timesteps[i + 1]
+            else:
+                t_prev_val = 0
+            t_prev = torch.full((B,), t_prev_val, dtype=torch.long, device=device)
+            ab_prev = sched.alpha_bar(t_prev)       # (B,)
+
+            extra_dims = x_t.dim() - 1
+            view = (-1,) + (1,) * extra_dims
+
+            ab_t_v = ab_t.view(view).to(device)
+            ab_prev_v = ab_prev.view(view).to(device)
+
+            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            x0_pred = x0_pred.clamp(-10.0, 10.0)
+
+            sigma = (
+                self.eta
+                * ((1.0 - ab_prev_v) / (1.0 - ab_t_v)).sqrt()
+                * (1.0 - ab_t_v / ab_prev_v).sqrt()
+            )
+            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_pred
+            noise = sigma * torch.randn_like(x_t)
+            x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
+
+        return x_t, type_ids
+
+    def sample_with_universal_guidance(
+        self,
+        fn: Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]],
+        shape: tuple[int, ...],
+        seed: int | None = None,
+        device: torch.device | str = "cpu",
+        type_init: str = "uniform",
+        n_valid_types: int = 12,
+        guidance_scale: float = 0.0,
+        guidance_min_step_frac: float = 0.1,
+        guidance_max_step_frac: float = 0.9,
+        grad_clip: float = 1.0,
+    ) -> tuple[Tensor, Tensor]:
+        """Sample using Universal Guidance with analytical energy surrogate.
+
+        Implements Bansal et al. (ICML 2023) with pairwise interpenetration
+        energy as the guidance function.
+
+        At each DDIM step:
+          1. Compute conditional eps prediction (no grad, fast path).
+          2. Project noisy state to clean estimate via Tweedie's formula.
+          3. Evaluate pairwise_overlap_energy on the clean estimate.
+          4. Backpropagate energy to x_t to get gradient.
+          5. Modify eps: eps_guided = eps - guidance_scale * sqrt(1 - ab_t) * grad
+          6. Standard DDIM update with eps_guided.
+
+        The guidance is active only between guidance_min_step_frac and
+        guidance_max_step_frac of the total DDIM steps. Guiding too early
+        (high noise) amplifies noise; guiding too late (low noise) fights
+        the final structure.
+
+        Args:
+            fn: Callable from denoiser.conditional_sampling_fn.
+                Signature: (x_t, type_ids, t) -> (eps_pred, type_logits).
+            shape: Output shape (B, N_MAX, N_CONT=13).
+            seed: Optional RNG seed.
+            device: Compute device.
+            type_init: 'uniform' or 'zeros'. See sample_with_types.
+            n_valid_types: Number of valid non-PAD types (12).
+            guidance_scale: Scale of analytical energy gradient. 0.0 = baseline
+                (identical to sample_with_types). Recommended range: 0.5-4.0.
+            guidance_min_step_frac: Don't guide before this fraction of steps.
+                0.1 = skip first 10% (very high noise levels).
+            guidance_max_step_frac: Don't guide after this fraction of steps.
+                0.9 = skip last 10% (nearly clean, let model finish).
+            grad_clip: Max L-inf norm for the guidance gradient. Prevents
+                numerical explosion on early steps with large gradients.
+
+        Returns:
+            (x_cont, type_ids): Denoised continuous features and type IDs.
+        """
+        # Lazy import to avoid circular dependency at module load.
+        from guidance.energy import pairwise_overlap_energy
+
+        if seed is not None:
+            generator = torch.Generator(device=device).manual_seed(seed)
+        else:
+            generator = None
+
+        B = shape[0]
+        N = shape[1]
+
+        x_t = torch.randn(shape, device=device, generator=generator)
+
+        if type_init == "uniform":
+            type_ids = torch.randint(
+                0, n_valid_types, (B, N), dtype=torch.long, device=device,
+                generator=generator,
+            )
+        elif type_init == "zeros":
+            type_ids = torch.zeros(B, N, dtype=torch.long, device=device)
+        else:
+            raise ValueError(
+                f"Unknown type_init {type_init!r}. Must be 'uniform' or 'zeros'."
+            )
+
+        sched = self.schedule
+        n_steps = len(self._timesteps)
+        guide_start = int(guidance_min_step_frac * n_steps)
+        guide_end = int(guidance_max_step_frac * n_steps)
+
+        for i, t_val in enumerate(self._timesteps):
+            t_tensor = torch.full((B,), t_val, dtype=torch.long, device=device)
+
+            # ---------------------------------------------------------------
+            # Standard forward pass (no grad for efficiency).
+            # ---------------------------------------------------------------
+            with torch.no_grad():
+                eps_pred, type_logits = fn(x_t, type_ids, t_tensor)
+
+            # Update type_ids from this step's logits (matches sample_with_types).
+            if n_valid_types < type_logits.shape[-1]:
+                type_logits = type_logits.clone()
+                type_logits[..., n_valid_types:] = float("-inf")
+            type_ids = type_logits.argmax(dim=-1)
+
+            # ---------------------------------------------------------------
+            # Universal Guidance: compute energy gradient on clean estimate.
+            # ---------------------------------------------------------------
+            if guidance_scale > 0.0 and guide_start <= i < guide_end:
+                ab_t = sched.alpha_bar(t_tensor).to(device).view(-1, 1, 1)  # (B,1,1)
+                sqrt_ab = ab_t.sqrt()
+                sqrt_1mab = (1.0 - ab_t).sqrt()
+
+                with torch.enable_grad():
+                    x_t_g = x_t.detach().requires_grad_(True)
+                    # Second forward pass through fn to get differentiable eps.
+                    eps_g, tl_g = fn(x_t_g, type_ids, t_tensor)
+
+                    # Tweedie's formula: x_0_hat = (x_t - sqrt(1-ab)*eps) / sqrt(ab)
+                    x0_hat = (x_t_g - sqrt_1mab * eps_g) / sqrt_ab.clamp(min=1e-8)
+                    x0_hat = x0_hat.clamp(-10.0, 10.0)  # match sample_with_types clamp
+
+                    # Type IDs for energy: use current greedy type_ids (already updated).
+                    energy = pairwise_overlap_energy(x0_hat, type_ids)
+                    energy_sum = energy.sum()
+
+                # Backprop only if energy is non-zero (skip if no overlaps).
+                if energy_sum.item() > 0.0:
+                    energy_sum.backward()
+                    if x_t_g.grad is not None:
+                        grad = x_t_g.grad.detach()
+                        # Clip gradient to prevent explosion.
+                        grad_norm = grad.abs().max()
+                        if grad_norm > grad_clip:
+                            grad = grad * (grad_clip / grad_norm)
+                        # Inject into eps: eps_guided = eps - s * sqrt(1-ab) * grad
+                        # (negative because we minimize energy).
+                        eps_pred = eps_pred - guidance_scale * sqrt_1mab.detach() * grad
+
+            # ---------------------------------------------------------------
+            # Standard DDIM update (identical to sample_with_types).
+            # ---------------------------------------------------------------
+            ab_t_v = sched.alpha_bar(t_tensor).to(device)
+            if i + 1 < len(self._timesteps):
+                t_prev_val = self._timesteps[i + 1]
+            else:
+                t_prev_val = 0
+            t_prev = torch.full((B,), t_prev_val, dtype=torch.long, device=device)
+            ab_prev = sched.alpha_bar(t_prev).to(device)
+
+            extra_dims = x_t.dim() - 1
+            view = (-1,) + (1,) * extra_dims
+            ab_t_v = ab_t_v.view(view)
+            ab_prev_v = ab_prev.view(view)
+
+            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            x0_pred = x0_pred.clamp(-10.0, 10.0)
+
+            sigma = (
+                self.eta
+                * ((1.0 - ab_prev_v) / (1.0 - ab_t_v)).sqrt()
+                * (1.0 - ab_t_v / ab_prev_v).sqrt()
+            )
+            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_pred
+            noise = sigma * torch.randn_like(x_t)
+            x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
+
+        return x_t, type_ids
 
     @torch.no_grad()
     def sample_cfg(

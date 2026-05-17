@@ -1,0 +1,39 @@
+# Classifier v2 -- stronger validity classifier for Phase B guidance.
+#
+# Improvements over classifier_v1:
+#   - d_model 128 -> 192 (~5M params vs ~2.5M)
+#   - n_layers 4 -> 5
+#   - Trained on classifier_v2 data: 0.5m perturbation + 3 corruption types
+#   - 3 epochs (was ~1 effective)
+#
+# Target: AUC > 0.75 on held-out split.
+# (Lowered from 0.85; uniform-t training has inherent ceiling at high-t
+# steps where valid/invalid are near-indistinguishable due to noise.)
+
+model:
+  d_model: 192
+  n_layers: 5
+  n_heads: 6
+  dropout: 0.1
+
+data:
+  shard_dir: "data/classifier_v2"
+  val_frac: 0.1
+
+training:
+  batch_size: 256
+  lr: 3.0e-4
+  warmup_steps: 500
+  n_epochs: 3
+  auc_threshold: 0.75   # Lowered from 0.85 -- see header note.
+  # pos_weight: auto if unset (defaults to 1.0 in trainer)
+  pos_weight: 1.0
+
+output:
+  dir: "checkpoints/classifier_v2"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "classifier_v2"
+  tags: ["classifier", "week4", "v2", "multi-corruption", "0.5m-shift"]

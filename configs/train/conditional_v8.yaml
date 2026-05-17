@@ -1,0 +1,93 @@
+# Training configuration: conditional_v8 -- 50M Parameter Scaling Test
+#
+# Week 4, Phase E. Tests whether the ~6% Drake validity ceiling at 9M params
+# is a capacity limit per deep-research literature findings.
+#
+# Architecture change: d_model=384, n_layers=8, n_heads=6 (~57M params, 6x v7).
+# All v7 fixes inherited: CFG dropout, gradient isolation, discrete type diffusion,
+# class-balanced sampler.
+#
+# Key differences from v7:
+#   - d_model: 256 -> 384
+#   - n_layers: 6 -> 8
+#   - n_heads: 8 -> 6  (head_dim: 32 -> 64)
+#   - batch_size: 128 -> 64  (VRAM budget at 50M params)
+#   - lr: 1.0e-4 -> 1.5e-4  (from-scratch, larger model benefits from higher peak LR)
+#   - warmup_steps: 500 -> 5000  (3.3% of 150k -- cosine warmup for stable large-model init)
+#   - max_steps: 100000 -> 150000  (from scratch needs more steps than warm-init)
+#   - checkpoint_steps: 5000 -> 10000
+#   - warm_init_from: removed (from scratch -- avoid inheriting v7 geometry biases)
+#   - class_weights: corrected PAD entry (5.630001) from class_distribution.md audit
+#
+# Usage (on pod):
+#   tmux new-session -d -s cond_v8 \
+#     "cd /workspace/Demiurge && source ~/.bashrc && \
+#      PYTHONPATH=/workspace/Demiurge/src python3 -u \
+#      scripts/train.py --config configs/train/conditional_v8.yaml \
+#      --seed 42 2>&1 | tee logs/cond_v8.log"
+
+text_conditioning: true
+
+model:
+  n_layers: 8
+  d_model: 384
+  n_heads: 6
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: true   # inherited from v6: stop gradient type->geometry
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  batch_size: 64              # reduced from 128 for VRAM headroom at 50M params
+  lr: 1.5e-4
+  lr_min: 1.0e-6
+  warmup_steps: 5000          # 3.3% of 150k -- cosine warmup for from-scratch stability
+  max_steps: 150000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 10000
+  val_every_epochs: 999999
+  val_n_scenes: 0
+  dtype: "float32"
+  use_class_balanced_sampler: true
+  weighted_sampling: false
+  # class_weights from class_distribution.md audit (13 entries: type_ids 0-11 + PAD)
+  # PAD entry corrected to 5.630001 (was 0.614200 in v7 -- that was a copy error)
+  class_weights: [0.508274, 0.509557, 0.524349, 0.610689, 0.576833, 0.614267, 0.649812, 0.540713, 0.785170, 0.674344, 0.658182, 0.717809, 5.630001]
+
+  cfg_dropout: 0.15   # 15% of batches: text_emb replaced with None (v7 fix, inherited)
+
+  use_discrete_type_diffusion: true  # inherited from v5/v6/v7
+
+  log_every_steps: 10
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 1.0
+  presence_bce: 1.0
+
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+output:
+  dir: "checkpoints/conditional_v8"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v8"
+  name: "conditional_v8"
+  tags: ["model", "week4", "conditional", "d384", "v8", "scaled", "50M",
+         "cfg-dropout", "discrete-type-diffusion", "type-grad-isolation", "from-scratch"]

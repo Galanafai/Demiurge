@@ -1,0 +1,105 @@
+# Training configuration: conditional_v5 -- Discrete Type Diffusion
+#
+# Week 4, Phase B. Fixes the 0% Drake validity seen when using
+# sample_with_types() on v4: the v4 model was trained with clean
+# type_ids at every step, so the argmax-updated type context fed by
+# sample_with_types() is out-of-distribution at steps t>0.
+#
+# Root cause: training/inference mismatch on the discrete modality.
+# Fix: corrupt type_ids during training with probability
+#   gamma_t = 1 - sqrt(alpha_bar_t)
+# so the model sees noisy type contexts at every noise level and learns
+# to denoise them, matching what sample_with_types() provides at inference.
+#
+# Key differences from conditional_v4:
+#   - training.use_discrete_type_diffusion: true    (THE FIX)
+#   - training.warm_init_from: conditional_v4/latest.pt (hot start)
+#   - training.max_steps: 30000     (warm init -- needs fewer steps)
+#   - training.num_workers: 2       (in-RAM data -- 2 workers optimal)
+#   - training.log_every_steps: 10
+#   - All other hyperparameters identical to v4.
+#
+# Usage (on pod):
+#   tmux new-session -d -s cond_v5 \
+#     "cd /workspace/Demiurge && source ~/.bashrc && \
+#      PYTHONPATH=/workspace/Demiurge/src python3 -u \
+#      scripts/train.py --config configs/train/conditional_v5.yaml \
+#      --seed 42 2>&1 | tee logs/cond_v5.log"
+
+text_conditioning: true
+
+model:
+  n_layers: 6
+  d_model: 256
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  batch_size: 128
+  lr: 1.0e-4
+  warmup_steps: 500
+  max_steps: 30000
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  ema_decay: 0.9999
+  checkpoint_steps: 5000
+  # Inline Drake validation disabled. Run probe_drake.py at milestones.
+  val_every_epochs: 999999
+  val_n_scenes: 0
+  dtype: "float32"
+  # Class-balanced sampler: same as v4.
+  use_class_balanced_sampler: true
+  weighted_sampling: false
+  # class_weights from scripts/compute_class_distribution.py on data/v1 (50k scenes).
+  # Identical to v4 -- data distribution is the same.
+  class_weights: [0.508274, 0.509557, 0.524349, 0.610689, 0.576833, 0.614267, 0.649812, 0.540713, 0.785170, 0.674344, 0.658182, 0.717809, 0.614200]
+
+  cfg_dropout: 0.15
+
+  # THE FIX: corrupt type_ids during training with gamma_t = 1 - sqrt(alpha_bar_t).
+  # At t=0 types are clean; at t=T-1 types are almost fully random uniform.
+  # This ensures sample_with_types() argmax-updated types are in-distribution
+  # at every DDIM step, preventing the geometry collapse seen in v4 fixed sampler.
+  use_discrete_type_diffusion: true
+
+  # Warm-init from conditional_v4 (step 50k). All weights carry over.
+  # The discrete type diffusion adapts the existing type-embedding pathway
+  # rather than re-learning it from scratch.
+  warm_init_from: checkpoints/conditional_v4/latest.pt
+  warm_init_keys: model_state
+
+  # DataLoader tuning: data is in RAM (2 tar shards, ~629MB).
+  # 2 workers is optimal -- more adds overhead without improving throughput.
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+  log_every_steps: 10
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.7
+  type_ce: 1.0
+  presence_bce: 1.0
+
+dataset:
+  path: "data/v1"
+  hash: "4b673befb672690802a87c3f31cdbe2ed0308bdb9df3df27eb261568a6d66d67"
+  held_out_per_template: 100
+
+output:
+  dir: "checkpoints/conditional_v5"
+
+wandb:
+  enabled: true
+  project: "demiurge"
+  experiment: "conditional_v5"
+  tags: ["model", "week4", "conditional", "d256", "v5",
+         "discrete-type-diffusion", "class-balanced", "type-ce-1.0", "warm-v4"]

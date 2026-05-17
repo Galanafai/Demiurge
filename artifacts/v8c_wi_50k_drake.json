@@ -1,0 +1,14 @@
+{
+  "model": "conditional_v8c_warminit",
+  "step": 50000,
+  "head": "ema",
+  "text_mode": "none",
+  "n_scenes": 100,
+  "accepted": 5,
+  "validity_rate": 0.05,
+  "rejection_reasons": {
+    "interpenetration": 22,
+    "rrt_failed": 64,
+    "ik_unreachable": 9
+  }
+}

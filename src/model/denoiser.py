@@ -53,6 +53,30 @@ class DenoiserConfig:
     n_heads: int = 8
     ffn_mult: int = 4
     dropout: float = 0.1
+    use_type_grad_isolation: bool = False
+    """Stop gradient on type_embed entering the token stream.
+
+    When True, the type embedding is detached before being added to the
+    continuous projection, so type embedding gradients cannot flow through
+    the transformer blocks into the geometry heads (head_xyz, head_rot6d,
+    head_scale, head_presence). The type embedding still receives gradients
+    via a residual injection into head_type, so type classification is
+    preserved without contaminating geometry learning.
+
+    When False (default), the original entangled behavior is used.
+    """
+    use_slot_id_embed: bool = False
+    """Add a learnable per-slot position embedding to break slot symmetry.
+
+    When True, a learnable Embedding(N_MAX, d_model) is added to each slot
+    token *before* the transformer blocks. This breaks the permutation
+    symmetry that causes all slots to collapse to the same mode when
+    training from scratch at large model sizes. The embedding is
+    orthogonally initialized to maximally separate slots in embedding space.
+
+    Should be True for from-scratch large models (>=20M params).
+    When False (default), no slot ID embedding is added (set-equivariant).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +249,13 @@ class SceneDenoiser(nn.Module):
         self.type_embed = nn.Embedding(N_TYPE, d)
         self.cont_proj = nn.Linear(N_CONT, d)
 
+        # Optional per-slot learnable position embedding (slot-ID embed).
+        # Breaks permutation symmetry at large model scales to prevent
+        # all slots collapsing to the same spatial mode.
+        self.slot_id_embed: nn.Embedding | None = (
+            nn.Embedding(N_MAX, d) if cfg.use_slot_id_embed else None
+        )
+
         # [NOISE_T] token: project timestep embedding to a single token.
         self.t_token_proj = nn.Linear(d, d)
 
@@ -262,6 +293,10 @@ class SceneDenoiser(nn.Module):
 
         AdaLN linear layers: zero-init so scale=0 and shift=0 at start,
         equivalent to standard LayerNorm on the first forward pass.
+
+        Slot ID embed (if enabled): orthogonal init so all N_MAX slot vectors
+        are maximally separated in embedding space from the start, preventing
+        attention from collapsing all slots to the same representation.
         """
         # Continuous noise heads: zero biases only.
         for head in (self.head_rot6d, self.head_xyz, self.head_scale):
@@ -274,6 +309,12 @@ class SceneDenoiser(nn.Module):
             if isinstance(block, _DenoiserBlock):
                 nn.init.zeros_(block.adaln.weight)
                 nn.init.zeros_(block.adaln.bias)
+        # Slot ID embed: orthogonal init for maximal slot separation.
+        if self.slot_id_embed is not None:
+            # nn.init.orthogonal_ requires (rows >= cols); slot_id_embed.weight
+            # is (N_MAX=12, d_model); since d_model >> N_MAX transpose trick:
+            w = self.slot_id_embed.weight  # (N_MAX, d)
+            nn.init.orthogonal_(w)
 
     def forward(
         self,
@@ -302,7 +343,23 @@ class SceneDenoiser(nn.Module):
         t_emb = self.t_mlp(t_sin)               # (B, d)
 
         # Per-slot token encoding: type embedding + continuous projection.
-        tok = self.type_embed(type_ids) + self.cont_proj(x_cont)  # (B, N_MAX, d)
+        # With type_grad_isolation, the type embedding is detached so its
+        # gradient cannot flow through the transformer blocks into geometry
+        # heads. The type embedding still receives gradients via a separate
+        # residual path into head_type only (see below).
+        type_emb_full = self.type_embed(type_ids)            # (B, N_MAX, d) -- gradient intact
+        if self.cfg.use_type_grad_isolation:
+            type_emb_tok = type_emb_full.detach()            # no grad into transformer
+        else:
+            type_emb_tok = type_emb_full                     # original entangled path
+
+        tok = type_emb_tok + self.cont_proj(x_cont)          # (B, N_MAX, d)
+
+        # Add slot ID embedding if enabled.
+        # Slot IDs are fixed 0..N_MAX-1 and broadcast over the batch.
+        if self.slot_id_embed is not None:
+            slot_ids = torch.arange(N_MAX, device=x_cont.device)  # (N_MAX,)
+            tok = tok + self.slot_id_embed(slot_ids).unsqueeze(0)  # (B, N_MAX, d)
 
         # Append [NOISE_T] token at position N_MAX.
         t_token = self.t_token_proj(t_emb).unsqueeze(1)  # (B, 1, d)
@@ -315,8 +372,16 @@ class SceneDenoiser(nn.Module):
         # Extract scene token outputs (exclude [NOISE_T]).
         scene_out = self.final_norm(tokens[:, :N_MAX])    # (B, N_MAX, d)
 
+        # Type head: inject the un-detached type embedding as a residual so
+        # head_type receives gradient through type_emb_full -> type_embed
+        # even when isolation is active. This preserves type learning without
+        # routing type gradients through the geometry-driving transformer.
+        # When isolation is off, type_emb_full == type_emb_tok so this is a
+        # no-op (residual of zero net effect on training signal).
+        type_head_in = scene_out + type_emb_full           # (B, N_MAX, d)
+
         return DenoiserOutput(
-            type_logits=self.head_type(scene_out),        # (B, N_MAX, 13)
+            type_logits=self.head_type(type_head_in),     # (B, N_MAX, 13)
             rot6d=self.head_rot6d(scene_out),             # (B, N_MAX, 6)
             xyz=self.head_xyz(scene_out),                 # (B, N_MAX, 3)
             scale=self.head_scale(scene_out),             # (B, N_MAX, 3)
@@ -328,10 +393,17 @@ class SceneDenoiser(nn.Module):
     ) -> Callable[[Tensor, Tensor, Tensor | None], Tensor]:
         """Return a callable compatible with DDIMSampler.sample().
 
+        .. deprecated::
+            This method passes ``type_ids=zeros`` at every denoising step,
+            creating a training/inference mismatch that causes type collapse.
+            Use :meth:`conditional_sampling_fn` with
+            :meth:`~model.schedule.DDIMSampler.sample_with_types` instead.
+
         The returned function packs the full DenoiserOutput back into a
         single (B, N_MAX, N_CONT) noise-prediction tensor for the DDIM loop.
-        Type ids are treated as zeros during sampling (argmax of logits is
-        applied post-hoc, not during denoising).
+        type_ids are frozen at zero throughout sampling; type logits are
+        discarded. This replicates the original (broken) behavior and is
+        preserved only for regression testing.
 
         Args:
             text_emb: Optional text embedding to close over.
@@ -341,10 +413,57 @@ class SceneDenoiser(nn.Module):
             shape (B, N_MAX, N_CONT) and eps_pred has the same shape.
         """
         def _fn(x_t: Tensor, t_idx: Tensor, _: Tensor | None) -> Tensor:
-            # Dummy type ids: zeros (will be replaced post-sampling).
+            # BROKEN: type_ids frozen at zero -- preserved for regression comparison only.
             type_ids = torch.zeros(x_t.shape[0], N_MAX, dtype=torch.long, device=x_t.device)
-            out = self.forward(x_t, type_ids, t_idx, text_emb)
-            # Pack continuous noise predictions back into (B, N_MAX, 13).
+            emb = text_emb
+            if emb is not None and emb.shape[0] == 1 and x_t.shape[0] > 1:
+                emb = emb.expand(x_t.shape[0], -1)
+            out = self.forward(x_t, type_ids, t_idx, emb)
             return torch.cat([out.xyz, out.rot6d, out.scale, out.presence_logit], dim=-1)
 
         return _fn
+
+    def conditional_sampling_fn(
+        self, text_emb: Tensor | None = None
+    ) -> Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]]:
+        """Return a callable for use with DDIMSampler.sample_with_types().
+
+        Unlike :meth:`noise_prediction_fn`, this returns both the continuous
+        noise prediction *and* the type logits, allowing the DDIM loop to
+        update ``type_ids`` at each step from the model's own predictions.
+
+        This closes the training/inference gap: the model was trained with
+        clean ``type_ids`` supplied at every step; this callable lets the
+        sampler maintain ``type_ids`` state across steps via argmax of
+        ``head_type`` output, approximating the training distribution.
+
+        Args:
+            text_emb: Optional frozen text embedding (B, D_TEXT=384).
+                Pass None for unconditional generation.
+
+        Returns:
+            Callable ``(x_t, type_ids, t) -> (eps_pred, type_logits)``
+            where:
+              - ``x_t``: (B, N_MAX, N_CONT) noisy continuous features
+              - ``type_ids``: (B, N_MAX) long tensor, current type estimate
+              - ``t``: (B,) long timestep tensor
+              - ``eps_pred``: (B, N_MAX, N_CONT) predicted noise
+              - ``type_logits``: (B, N_MAX, N_TYPE) raw type logits
+        """
+        def _fn(
+            x_t: Tensor,
+            type_ids: Tensor,
+            t_idx: Tensor,
+        ) -> tuple[Tensor, Tensor]:
+            # Broadcast text_emb to match the actual batch size of x_t.
+            # text_emb may be (1, D_TEXT) when the sampler encodes per-prompt;
+            # x_t may be (B, N_MAX, N_CONT) with B > 1 for batched generation.
+            emb = text_emb
+            if emb is not None and emb.shape[0] == 1 and x_t.shape[0] > 1:
+                emb = emb.expand(x_t.shape[0], -1)
+            out = self.forward(x_t, type_ids, t_idx, emb)
+            eps = torch.cat([out.xyz, out.rot6d, out.scale, out.presence_logit], dim=-1)
+            return eps, out.type_logits
+
+        return _fn
+

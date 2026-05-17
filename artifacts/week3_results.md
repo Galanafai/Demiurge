@@ -136,27 +136,49 @@ This is not a flaw in the evaluation methodology. The VLM harness correctly iden
 real model limitation that was invisible to the Drake validity metric alone. The two evaluation
 axes (geometric validity, semantic alignment) are complementary, not redundant.
 
-### Week 4 Remediation
+### Week 4 Remediation -- OUTCOME: FAILED
 
-1. Class-balanced sampling: weight dataset sampler by object type distribution per scene
-2. Weighted cross-entropy: inverse-frequency class weights (~20x upweight on non-cube types)
-3. Increase `type_ce` weight from 0.1 to 1.0
+Attempted interventions in `conditional_v4` (50k steps, warm init from v2):
+1. Class-balanced sampling: inverse-frequency type weighting
+2. Weighted cross-entropy: `type_ce` raised from 0.1 to 1.0
+3. Warm init from `conditional_v2` checkpoint
 
-Success criterion: VLM mean score >2.5 on `tabletop_reach` and `cluttered_pick`. Joint
-Drake+VLM>=4 rate >5%.
+**Phase A gate evaluation (1,536 conditioned scenes, 200 descriptions):**
+
+| Gate | Threshold | v4 result | Pass? |
+|---|---|---|---|
+| VLM mean score | > 2.0 | 1.12 | FAIL |
+| Joint Drake+VLM>=4 | > 5% | 0.00% | FAIL |
+| Per-type diversity | >=5/12 types | 6/12 (only 2 with real presence) | FAIL |
+| Type 0 fraction | < 50% | 88.7% | FAIL |
+
+Drake validity regressed from 9.8% (v2 conditioned) to 7.49% (v4 conditioned).
+Interpenetration rate tripled (20% to 49.3% of rejections).
+
+**`conditional_v2` remains the shipped conditional baseline.** `conditional_v4` is abandoned.
+
+Loss reweighting + class-balanced sampling are insufficient interventions. Root cause
+investigation is required to identify whether the failure is in the text encoder embedding
+space, the type embedding matrix, the output head bias, or the cross-attention conditioning
+pathway. See `artifacts/conditional_v4_phase_a_results.md` for full gate results.
 
 ---
 
 ## Artifacts
 
-- `checkpoints/conditional_v2/latest.pt` -- v2 ship checkpoint (100k steps)
+- `checkpoints/conditional_v2/latest.pt` -- **shipped conditional baseline** (100k steps)
 - `checkpoints/conditional_v3/latest.pt` -- v3 final checkpoint (115k steps)
+- `checkpoints/conditional_v4/latest.pt` -- v4 abandoned (50k steps, failed Phase A)
 - `artifacts/conditional_v3_final_probe.json` -- raw probe results (both heads)
+- `artifacts/conditional_v4_phase_a_results.md` -- full Phase A gate results for v4
+- `artifacts/conditional_v4_vlm_probe.json` -- raw v4 Phase A probe (1,536 scenes)
 - `artifacts/conditional_vlm_eval.md` -- Task 9 VLM evaluation report (type collapse finding)
 - `artifacts/week3_vlm_eval/haiku_scores.summary.json` -- Haiku bulk judge summary
 - `artifacts/week3_vlm_eval/sonnet_cross_val.summary.json` -- Sonnet CV summary
 - `artifacts/week3_vlm_eval/sonnet_disagreement.summary.json` -- 290-case Sonnet re-judge
 - `logs/v3_final_probe.log` -- full probe stdout
+- `logs/v4_vlm_probe.log` -- full v4 Phase A probe stdout
 - `configs/train/conditional_v3.yaml` -- v3 training config
-- W&B project: `galanafai-self/demiurge`, runs `iqfebjel` (v2), `wvdoaybk` (v3)
-- Total VLM API cost: $3.47 (Haiku $2.68 + Sonnet CV $0.13 + Sonnet disagreement $0.67)
+- `configs/train/conditional_v4.yaml` -- v4 training config (failed intervention)
+- W&B project: `galanafai-self/demiurge`, runs `iqfebjel` (v2), `wvdoaybk` (v3), `9idj9jem` (v4)
+- Total VLM API cost: $3.47 (Week 3) + $1.43 (v4 Phase A) = $4.90
