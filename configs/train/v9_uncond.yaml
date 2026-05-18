@@ -1,0 +1,50 @@
+# v9 unconditional training — 49M params, 234k data, from scratch
+# All keys match exact names expected by scripts/train.py
+
+model:
+  n_layers: 16
+  d_model: 384
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: true
+  use_slot_id_embed: true   # breaks permutation symmetry at 16-layer scale
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  max_steps: 150000
+  batch_size: 64
+  lr: 3.0e-4
+  warmup_steps: 2000
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  gradient_accumulation: 1
+  checkpoint_steps: 10000
+  val_every_epochs: 1      # treat each full pass as an epoch; probes handled via Drake
+  val_n_scenes: 100
+  weighted_sampling: false  # 1.7x type ratio is fine without weighting
+  dtype: float32            # RTX5080 has sm_120, PyTorch bfloat16 unsupported
+  log_every_steps: 100
+  cfg_dropout: 0.0          # unconditional run
+  warm_init_from: null
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 0.5
+  type_ce: 0.1
+  presence_bce: 0.05
+
+dataset:
+  path: data/combined
+  hash: ""                  # skip hash check - combined dir uses symlinks
+
+text_conditioning: false
+
+logging:
+  project: demiurge
+  entity: galanafai-self
+  run_name: v9_uncond_150k
