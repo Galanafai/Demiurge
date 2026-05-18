@@ -47,7 +47,11 @@ dataset:
 
 text_conditioning: false
 
-logging:
+wandb:
+  enabled: true
   project: demiurge
-  entity: galanafai-self
-  run_name: v9_uncond_150k
+  experiment: v9_uncond_150k
+  tags: [v9, uncond, phase-b, 49M, 234k]
+
+output:
+  dir: checkpoints/v9_uncond
