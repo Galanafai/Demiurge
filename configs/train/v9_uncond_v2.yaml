@@ -1,0 +1,76 @@
+# v9 uncond v2 -- retrain to fix type head collapse
+#
+# Root cause: use_type_grad_isolation=true caused the type head to learn a
+# degenerate shortcut: perfect input copying (log_softmax max=0, NLL=0).
+# The type head never received geometry-signal gradients, only the isolated
+# type CE, which it immediately saturated to 0 by memorizing the input.
+# Consequence: geometry (pose_xyz, rot) dominated the loss, but all 150k
+# steps were spent on geometry with zero type signal. The result: the model
+# denoises xyz/rot well in training-distribution space, but with 6.8 objects
+# tightly packed (uncalibrated presence) they all interpenetrate.
+#
+# Fixes applied:
+#   1. use_type_grad_isolation: false  -- type gradients flow through backbone
+#   2. use_discrete_type_diffusion: true  -- type inputs noisy at train time
+#   3. pose_xyz: 5.0  -- stronger geometry signal
+#   4. presence_bce: 1.0  -- force presence calibration
+#   5. type_ce: 2.0  -- must actually contribute to loss
+#   6. warm_init_from: step_00150000.pt  -- start from broken v9, 100k steps
+#
+# All field names match scripts/train.py exactly.
+
+model:
+  n_layers: 16
+  d_model: 384
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: false   # FIX: was true (caused type head collapse)
+  use_slot_id_embed: true
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  max_steps: 100000
+  batch_size: 64
+  lr: 5.0e-5             # lower lr for warm-init fine-tune
+  warmup_steps: 500
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  gradient_accumulation: 1
+  checkpoint_steps: 10000
+  val_every_epochs: 1
+  val_n_scenes: 100
+  weighted_sampling: false
+  dtype: float32
+  log_every_steps: 100
+  cfg_dropout: 0.0
+  warm_init_from: checkpoints/v9_uncond/step_00150000.pt
+  use_discrete_type_diffusion: true   # FIX: noisy type inputs at train time
+
+loss:
+  pose_xyz: 5.0          # FIX: boosted (was 1.0, geometry signal too weak)
+  pose_rot: 1.0
+  scale: 1.0
+  type_ce: 2.0           # FIX: boosted (was 0.1 and had zero gradient)
+  presence_bce: 1.0      # FIX: boosted (was 0.05, presence uncalibrated)
+
+dataset:
+  path: data/combined
+  hash: ""
+  num_workers: 32
+  persistent_workers: true
+  prefetch_factor: 4
+
+text_conditioning: false
+
+wandb:
+  enabled: true
+  project: demiurge
+  experiment: v9_uncond_v2_fix
+  tags: [v9, uncond, phase-b-fix, 49M, 234k, type-grad-fix]
+
+output:
+  dir: checkpoints/v9_uncond_v2
