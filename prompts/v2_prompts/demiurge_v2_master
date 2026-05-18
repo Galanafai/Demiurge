@@ -1,0 +1,695 @@
+# Demiurge v2 Master Plan: Weeks 2-5 Redo for 49M Model on 234k Data
+
+## What This Document Is
+
+This is the master plan for redoing Weeks 2-5 of Demiurge with the larger 49M parameter model trained on the new 234k Drake-validated scene corpus (v1+v2). Each prior week becomes a phase here, but compressed since most infrastructure already exists.
+
+This is NOT a prompt. It's the planning document. Prompts split off this in a separate pass.
+
+## Context: What We Have vs. What Original Weeks Had
+
+| Resource | Original Weeks 2-5 | This Run |
+|---|---|---|
+| Training scenes | 50k (built fresh in W2) | 234k (v1 + v2 already on W&B) |
+| Model target | 9M (v7 final) | 49M (v9 target) |
+| Validator | Built fresh in W1 | Exists, validated, unchanged |
+| Procedural sampler | Built fresh in W2 | Exists, used to generate v1+v2 |
+| Training scripts | Built fresh in W3 | Exists with v4-v8 configs as reference |
+| Text conditioning | Built fresh in W3 | Exists, sentence-transformers embeddings cached |
+| Class balancing | Built fresh in W4 | Exists (Phase A v4 fix) — likely skip this run |
+| UG infrastructure | Built fresh in W5 | Exists at src/guidance/energy.py |
+| Eval harness | Built fresh in W5 | Exists in scripts/run_eval.py |
+| VLM judging | Built fresh in W5 | Exists with caching |
+| Pareto plotting | Built fresh in W5 | Exists at scripts/plot_pareto.py |
+
+Translation: this isn't really Weeks 2-5 redo. It's "v9 training + re-eval with existing scripts on existing infrastructure." Much faster than original.
+
+## The Three Real Things We're Doing
+
+Stripped of historical baggage:
+
+1. Train v9 unconditional (49M, 234k data, from scratch)
+2. Validate it works visually (VLM probe before spending more compute)
+3. Train v9 conditional (warm-init from v9 uncond, add text + CFG dropout)
+4. Run UG sweep + eval harness on v9
+5. Ship Week 6 writeup (LinkedIn, README, demo)
+
+The validation gate after unconditional is your explicit ask. Smart move — prevents burning compute on cond training if uncond is broken.
+
+## Phase Map
+
+| Phase | Original Week | Time | GPU Cost | VLM Cost | Decision Gate |
+|---|---|---|---|---|---|
+| A: Data Prep | W2 | 4 hrs | $3 | $0 | Combined dataset loads, splits saved |
+| B: Uncond Training | W3 | 8 hrs | $6 | $0 | Drake > 5% at step 100k |
+| C: VLM Quality Check | W3 | 2 hrs | $1 | $3 | VLM mean > 2.0 |
+| D: Cond Training | W3 | 10 hrs | $7 | $0 | Drake cond > 3% |
+| E: UG Sweep | W4-5 | 4 hrs | $3 | $2 | Pareto produced |
+| F: Eval Harness | W5 | 3 hrs | $2 | $2 | Results table built |
+| G: Gallery + MP4 | W5 | 2 hrs | $1 | $0 | Visual artifacts complete |
+| H: Ship | W6 | 6 hrs | $0 | $0 | LinkedIn post live |
+| Total | | 39 hrs | $22 | $7 | ~$30 + 1 week |
+
+This is a 1-week sprint. Different from original 4-week Weeks 2-5 because the infrastructure exists.
+
+---
+
+## Phase A: Data Preparation (W2-equivalent)
+
+Goal: Combine v1 + v2 into unified training corpus with train/val/held-out splits.
+
+Original W2 work that's already done:
+- Procedural sampler implemented
+- Dataset writer (WebDataset format) implemented
+- Diversity metrics computed (v1 baseline established)
+- Generation script with parallel workers exists
+- Dataset card template exists
+
+### A.1: Restore datasets from W&B
+
+Pod resumed from pause. Download both datasets to local pod disk:
+- dataset_v1_tars:latest (50k scenes, ~600 MB)
+- dataset_v2_tars:latest (184k scenes, ~2.2 GB)
+
+Combined: ~2.8 GB on disk.
+
+### A.2: Combined corpus verification
+
+- Inventory shards (expect 4 v1 + ~28 v2 shards)
+- Spot-check 100 random scenes per dataset for tensor format consistency
+- Verify text descriptions present in v2
+- Compute combined acceptance rate distribution (should be ~8-10% averaged)
+
+### A.3: Train/val/held-out split
+
+Hard split, fixed for whole project:
+- 220k training (94%)
+- 7k validation (3%) — used during training for loss monitoring
+- 7k held-out (3%) — final eval only, NEVER touched during training
+
+Save manifest to data/combined/split_manifest.json. Locked benchmark.
+
+### A.4: Text embeddings cache
+
+Use existing src/model/text_encoder.py to compute MiniLM-L6-v2 embeddings for all 234k descriptions. Cache to data/combined/text_embeddings.pt.
+
+Note: v1 embeddings already cached. Only need to compute v2 (~184k new).
+
+### A.5: Dataset card update
+
+Build artifacts/dataset_combined_v1v2_card.md:
+- Total accepted: 234k
+- Per-template counts
+- Per-check rejection breakdown
+- Diversity metrics: scene encoding + sentence-transformer
+- Histograms: object count, goal distance, description length
+- Comparison to v1-only baseline
+
+### Phase A Deliverables
+
+- data/combined/ ready for training
+- data/combined/split_manifest.json
+- data/combined/text_embeddings.pt
+- artifacts/dataset_combined_v1v2_card.md
+
+### Phase A Gate
+
+Must pass before Phase B:
+- All 234k scenes load correctly
+- Split is balanced across templates
+- Embeddings present for all train + val descriptions
+
+---
+
+## Phase B: Unconditional Training (W3-equivalent, uncond only)
+
+Goal: Train 49M unconditional baseline. Establish architecture works at scale.
+
+Original W3 work that's already done:
+- Denoiser architecture exists with d_model knob
+- Diffusion schedule (cosine, 1000 steps) implemented
+- Rotation representation (6D continuous) implemented
+- Loss module with per-component weights exists
+- Training script with Hydra config exists
+- W&B logging set up
+- DDIM sampler at 50 steps validated
+
+### B.1: 49M architecture config
+
+Create configs/train/v9_uncond.yaml:
+
+```yaml
+model:
+  d_model: 384
+  n_layers: 16
+  n_heads: 8
+  ffn_multiplier: 4
+  # Target: ~49M parameters
+
+training:
+  max_steps: 200000
+  batch_size: 64
+  lr: 3e-4
+  warmup_steps: 2000
+  schedule: cosine
+  warm_init_from: null  # Start from scratch
+  val_every_steps: 5000
+  val_n_scenes: 100
+  num_workers: 8
+  cfg_dropout: 0.0  # Unconditional
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 1.0
+  type_ce: 0.1
+  presence_bce: 0.5
+
+ema:
+  decay: 0.9999
+
+data:
+  source: data/combined/
+  split: train
+  use_class_balanced_sampler: false
+```
+
+Decision: no class balancing. Original W4 needed it at 50k. With 4.7x more data, slot collapse should not occur. If it does, we add it back.
+
+Decision: from scratch, not warm-init from v7. v7 is 9M, architecturally different from 49M.
+
+### B.2: Auto-upload to W&B (CRITICAL)
+
+Build scripts/upload_v9_uncond.py BEFORE training launches. Run in upload_monitor tmux session. Same pattern as v7 retrain. Don't lose another checkpoint.
+
+### B.3: Launch training
+
+In tmux. Expected wall-clock: ~8 hours for 200k steps.
+
+### B.4: Mid-training Drake probes
+
+Every 5k steps (first 100k) then every 10k steps (last 100k):
+- 100 unconditional scenes (DDIM 50 steps, EMA weights)
+- Drake validation
+- Log: validity rate, type distribution, mean pairwise diversity, per-component loss
+
+Early-warning system. If validity stays at 0% through step 50k, halt.
+
+### B.5: Final probe at step 200k
+
+500-scene unconditional probe:
+- Drake validity (target: > 5%)
+- Type distribution (all 12 types present)
+- Mean pairwise diversity (target: comparable to v7's 0.14)
+- Loss converged (total loss < 1.5)
+
+Save to artifacts/v9_uncond_probe.json.
+
+### Phase B Decision Gate
+
+| Metric | Threshold | Action if fail |
+|---|---|---|
+| Drake validity uncond | > 5% | Halt; investigate |
+| All 12 types present | yes | Halt; add class balancing |
+| Loss converged | total < 1.5 | Continue with caveat |
+
+---
+
+## Phase C: VLM Quality Check (W3-equivalent, evaluation only)
+
+Goal: Verify unconditional model produces visually plausible scenes BEFORE expensive conditional training.
+
+This is the validation step you specifically requested. Drake validity says "geometrically valid." VLM check says "looks right."
+
+Original W3 work that's already done:
+- VLM judging script with caching exists
+- Haiku 4.5 scene_judge prompt template exists
+- Gallery render script exists
+
+### C.1: Generate scenes for judging
+
+- 100 unconditional scenes from v9
+- Drake-validate each
+- Render to PNG via Drake offscreen
+- Save to artifacts/v9_uncond_vlm_subset/
+
+### C.2: VLM scoring
+
+Run scripts/judge_with_vlm.py:
+- Claude Haiku 4.5
+- Existing scene_judge prompt template
+- Cache responses
+- Output: artifacts/v9_uncond_vlm_scores.jsonl
+
+Cost: ~$1-3.
+
+### C.3: Score analysis
+
+- Mean VLM score (target: > 2.0)
+- Score distribution
+- Per-type breakdown
+- Highest and lowest scoring examples
+
+### C.4: Visual sanity check
+
+Mini-gallery: 10 highest, 10 lowest, 10 random. Save to artifacts/v9_uncond_quick_gallery.png.
+
+### Phase C Decision Gate
+
+| Metric | Threshold | Action if fail |
+|---|---|---|
+| VLM mean score | > 2.0 | Investigate before Phase D |
+| No peak at 1.0 | yes | Continue with caveat |
+| Type diversity | all 12 visible | Add class balancing in Phase D |
+
+If pass: confidence to spend $7 + 10 hours on cond training.
+If fail: cheap stop. Diagnose before committing.
+
+---
+
+## Phase D: Conditional Training (W3-equivalent, conditional)
+
+Goal: Add text conditioning with CFG dropout. Beat v7 cond validity.
+
+Original W3+W4 work that's already done:
+- Cross-attention to text embeddings implemented
+- CFG dropout pattern from v7 exists
+- Conditional training script exists
+- Per-prompt type accuracy probe exists
+- Eps correlation diagnostic exists
+
+### D.1: 49M conditional architecture config
+
+Create configs/train/v9_cond.yaml:
+
+```yaml
+model:
+  d_model: 384
+  n_layers: 16
+  n_heads: 8
+  ffn_multiplier: 4
+  cross_attention: true
+  text_emb_dim: 384
+
+training:
+  max_steps: 200000
+  batch_size: 64
+  lr: 1e-4
+  warmup_steps: 2000
+  schedule: cosine
+  warm_init_from: checkpoints/conditional_v9_uncond/latest.pt
+  cfg_dropout: 0.15
+  val_every_steps: 5000
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 1.0
+  type_ce: 0.1
+  presence_bce: 0.5
+
+data:
+  source: data/combined/
+  split: train
+  text_embeddings: data/combined/text_embeddings.pt
+```
+
+### D.2: Auto-upload setup
+
+Same pattern: scripts/upload_v9_cond.py ready before launch.
+
+### D.3: Launch training
+
+Expected: ~10-12 hours wall-clock.
+
+### D.4: Mid-training probes
+
+Every 5k steps:
+- 100 conditional scenes at cfg=1.0
+- Drake validity
+- Per-prompt type accuracy
+- Eps correlation between cond/uncond paths
+
+### D.5: Final probe at step 200k
+
+Comprehensive:
+- 500 unconditional scenes (didn't degrade)
+- 200 conditional × 8 samples
+- CFG sweep: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0
+- VLM scoring on best CFG (100 scenes)
+- Per-prompt type accuracy
+- Eps correlation
+
+Save to artifacts/v9_cond_phase_d_results.md.
+
+### Phase D Decision Gate
+
+| Metric | v7 baseline | v9 target | Action if fail |
+|---|---|---|---|
+| Drake uncond (cfg=0) | 6.5% | > 5% | Halt if < 3% |
+| Drake cond (best CFG) | 1.4% | > 3% | Continue but flag |
+| Per-prompt type acc | 99.9% | > 95% | Investigate |
+| Eps correlation | 0.994 | > 0.95 | Halt if < 0.9 |
+
+---
+
+## Phase E: Universal Guidance Sweep (W4-W5-equivalent)
+
+Goal: Apply UG to v9. See if held-out generalization gap closes.
+
+Original W4-W5 work that's already done:
+- UG infrastructure at src/guidance/energy.py
+- Analytical pairwise overlap energy
+- Object geometry primitives
+- Sweep script at scripts/run_universal_guidance_sweep.py
+- Tests at tests/guidance/
+- Pareto plot script exists
+
+### E.1: Smoke test
+
+Single UG run at scale=2.0, 50 prompts, 4 scenes. Verify gradient injection works on v9 (same SceneTensor format).
+
+### E.2: Full sweep
+
+6 guidance scales × 3 seeds × 200 prompts × 5 scenes = 18,000 scenes.
+
+Scales: 0.0, 0.5, 1.0, 2.0, 4.0, 8.0
+
+Output: artifacts/v9_ug_sweep/summary.jsonl
+
+Wall-clock: 4-5 hours.
+
+### E.3: VLM judging on subset
+
+100 random scenes per config × 18 configs = 1800 VLM calls. ~$2-3.
+
+### E.4: Pareto plot
+
+artifacts/pareto_v9.png overlaying v9 results on v7 reference points.
+
+### Phase E Outcome (no halt)
+
+Compare:
+- UG@best vs v9 cond baseline
+- UG@best vs v7 UG (11.1% in-dist)
+- UG@held-out vs v7 UG@held-out (1.3%)
+
+No hard halt. Ship whatever we get.
+
+---
+
+## Phase F: Full Held-Out Evaluation (W5-equivalent)
+
+Goal: Run eval harness against v9. Build comparison table.
+
+Original W5 work that's already done:
+- Eval suite of 200 held-out prompts (locked benchmark)
+- Metrics module (validity, diversity, prompt-following)
+- Eval harness with parallel workers
+- Results table template
+
+### F.1: Reuse Week 5 eval suite
+
+data/eval_suite_v1/ has 200 held-out prompts. Don't regenerate. Locked benchmark.
+
+### F.2: Run eval on v9 samplers
+
+5 samplers × 3 seeds:
+- v9 unconditional baseline
+- v9 conditional baseline (best CFG)
+- v9 rejection sampler
+- v9 + UG@best
+- v9 + UG@scale1 (curve point)
+
+Output: artifacts/eval_v9/<sampler>.json
+
+### F.3: Comparison table
+
+artifacts/results_table_v9.md:
+
+| Sampler | v7 (Week 5) | v9 (this run) | Delta |
+|---|---|---|---|
+| Uncond | 1.2% | X% | +/-Y |
+| Cond (best CFG) | 1.4% | X% | +/-Y |
+| Rejection | 5.5% | X% | +/-Y |
+| UG best | 11.1% in-dist, 1.3% held-out | X%/Y% | +/-Z |
+
+### F.4: Ablations (pick 1)
+
+From menu:
+- Guidance schedule: constant vs cosine vs warm-up
+- UG bounding radius scaling
+- CFG scale interaction with UG
+
+Pick whichever is most interesting.
+
+---
+
+## Phase G: Gallery + Demo MP4 (W5-equivalent)
+
+Goal: Final visual artifacts for portfolio.
+
+### G.1: Gallery render
+
+100 generated scenes from best v9 sampler, 10x10 grid PNG.
+- Evenly sampled across templates
+- Each tile shows scene + prompt overlay
+- Save artifacts/v9_final_gallery.png
+
+### G.2: Denoising demo MP4
+
+50 DDIM steps for one representative prompt.
+- 24fps standard version
+- 12fps slow version (for LinkedIn)
+- Save artifacts/v9_denoising_demo.mp4
+
+### G.3: Verification pass
+
+- ruff check .
+- pyright
+- pytest tests/ -q
+
+Acceptance: 0 errors, all pass.
+
+---
+
+## Phase H: Ship (W6-equivalent)
+
+Goal: LinkedIn post, README polish, portfolio packaging.
+
+### H.1: LinkedIn post
+
+Pick best angle based on actual v9 results:
+
+If v9 dramatically beats v7:
+"Demiurge v9: 49M conditional diffusion achieves X% physical validity. Scaling from 9M to 49M with 4.7x more data..."
+
+If v9 matches v7:
+"Investigated architectural scaling for conditional scene generation. Found that 5x params + 4.7x data does not unlock fundamentally new capability..."
+
+If v9 underperforms v7:
+"Negative result: scaling alone does not solve joint physical-semantic validity..."
+
+### H.2: README polish
+
+- Project overview
+- Quick start
+- Results summary with Pareto + table
+- Gallery image
+- Reproduction instructions
+
+### H.3: Final commit and tag
+
+Merge week6/v9-training to main. Tag as v1.0 release.
+
+### H.4: Optional - HuggingFace Space
+
+Interactive demo if time/energy allows. Not required.
+
+---
+
+## Critical Cross-Phase Rules
+
+These apply throughout, not just one phase:
+
+### Auto-upload everything
+
+Every checkpoint goes to W&B IMMEDIATELY after training completes via upload_monitor tmux. No exceptions. We lost v7 once; never again.
+
+### Plant cleanup between phases
+
+- Keep only latest.pt for each model
+- W&B has versioned history
+- Frees disk for next phase
+
+### Validation cadence
+
+- Phase B+D: Drake probes every 5k-10k steps during training
+- Phase C: VLM scoring after Phase B completes
+- Phase E: VLM scoring on UG subset
+- Phase F: Full VLM scoring as part of eval harness
+
+### Commit cadence
+
+After each phase deliverable:
+- git add relevant files
+- git commit with descriptive message
+- Phase results doc updated
+- Progress visible on GitHub
+
+### Global halt conditions
+
+Halt entire pipeline if:
+- Pod disk < 5 GB free
+- Total cost exceeds $35
+- v7 checkpoint lost from W&B
+- W&B connectivity dies for > 1 hour
+
+---
+
+## What Each Phase's Prompt Will Look Like
+
+The plan above produces 8 prompts (one per phase). Each prompt will:
+
+1. Pre-flight section (verify pod state, deps, prior phase complete)
+2. Numbered execution steps (specific commands, configs)
+3. Validation/probe section (Drake + VLM where applicable)
+4. Auto-upload section (W&B safeguard)
+5. Decision gate (clear pass/fail criteria)
+6. Commit + cleanup (git, disk)
+7. Halt conditions (when to stop and surface)
+8. Cost estimate (dollars + hours)
+
+Prompts will be ~300-500 lines each, formatted similar to your Week 4 / Week 5 master prompts. Same structure, scoped to one phase.
+
+---
+
+## Risk Map
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| v9 uncond Drake validity < 5% | Medium | Phase B gate halts before wasting Phase D compute |
+| v9 VLM scores low despite Drake OK | Medium | Phase C catches this cheaply ($1-3) |
+| v9 cond Drake < 3% | Medium | Phase D gate; fallback to v9 uncond + v7 cond |
+| UG doesn't generalize | High | Already prepared for this story |
+| Out of budget | Low | Halt conditions; phases independent |
+| Training takes longer | Medium | Reduce max_steps to 100k if needed |
+| Disk fills up | Medium | Aggressive cleanup between phases |
+| Pod disconnects mid-training | Low | nohup + tmux pattern; auto-resume |
+
+---
+
+## What Could Make Us Skip Phases
+
+Skip Phase E (UG) if: Phase D shows v9 cond dramatically better than v7 (>10%). UG was a workaround for low cond validity. If we have it natively, skip.
+
+Skip Phase G ablations if: Out of time. Just ship headline result.
+
+Skip Phase H Hugging Face Space if: Not relevant to immediate portfolio goal.
+
+---
+
+## Deliverables by Phase
+
+### Phase A produces:
+- data/combined/ (234k scenes ready)
+- data/combined/split_manifest.json
+- data/combined/text_embeddings.pt
+- artifacts/dataset_combined_v1v2_card.md
+
+### Phase B produces:
+- checkpoints/conditional_v9_uncond/latest.pt (local + W&B)
+- artifacts/v9_uncond_phase_b_results.md
+- artifacts/v9_uncond_probe.json
+
+### Phase C produces:
+- artifacts/v9_uncond_vlm_scores.jsonl
+- artifacts/v9_uncond_quick_gallery.png
+- artifacts/v9_phase_c_decision.md
+
+### Phase D produces:
+- checkpoints/conditional_v9_cond/latest.pt (local + W&B)
+- artifacts/v9_cond_phase_d_results.md
+- artifacts/v9_cfg_sweep.json
+
+### Phase E produces:
+- artifacts/v9_ug_sweep/ (18 configs)
+- artifacts/pareto_v9.png and .pdf
+- artifacts/v9_ug_results.md
+
+### Phase F produces:
+- artifacts/eval_v9/ (5 samplers × 3 seeds)
+- artifacts/results_table_v9.md
+
+### Phase G produces:
+- artifacts/v9_final_gallery.png
+- artifacts/v9_denoising_demo.mp4
+
+### Phase H produces:
+- LinkedIn post (drafted, published manually)
+- Updated README
+- v1.0 git tag
+- Merge to main
+
+---
+
+## Open Questions To Resolve Before Phase A
+
+Quick decisions needed:
+
+1. Warm-init for Phase B uncond from v7's uncond weights? Plan: no, train from scratch. Alternative: v7 warm-init since we have it. Tradeoff: complicates architectural comparison story but could speed convergence.
+
+2. CFG sweep range for Phase D final probe? Plan: 0.0-5.0. Open to extending.
+
+3. Ablations choice for Phase F? Suggesting "guidance schedule variants" as default.
+
+4. Skip Phase G entirely if Phase F shows v9 doesn't beat v7? Possibly. Visual demo doesn't change underlying numbers.
+
+5. Class balancing in Phase B? Plan: no. Acceptable to revisit if Phase B probe shows type collapse.
+
+---
+
+## Total Estimated Cost
+
+| Item | Hours | Cost |
+|---|---|---|
+| Pod time (39 hrs × $0.74) | 39 | $29 |
+| VLM API (Haiku 4.5) | - | $7 |
+| Total | 39 | ~$36 |
+
+Within original Week 4-5 budget envelope. The extra $6 reflects training a bigger model on more data.
+
+---
+
+## Calendar
+
+If we start tomorrow morning:
+
+- Day 1: Phase A (4 hrs) + Phase B launch (training overnight)
+- Day 2: Phase B finish + Phase C (3 hrs total)
+- Day 3: Phase D launch (training overnight)
+- Day 4: Phase D finish + Phase E launch
+- Day 5: Phase E finish + Phase F
+- Day 6: Phase G + Phase H planning
+- Day 7: Phase H ship
+
+One week sprint. Realistic if no major setbacks.
+
+If setbacks: phases B and D could each spill an extra half-day. Realistic total: 6-9 days.
+
+---
+
+## What "Done" Means
+
+Ship is complete when:
+
+1. conditional_v9_uncond and conditional_v9_cond checkpoints on W&B
+2. artifacts/v9_final_gallery.png exists
+3. artifacts/v9_denoising_demo.mp4 exists
+4. artifacts/results_table_v9.md has v7 vs v9 comparison
+5. artifacts/pareto_v9.png exists
+6. LinkedIn post drafted (publication is your call)
+7. README updated on GitHub main branch
+8. v1.0 tag pushed
+
+This is the version of Demiurge that goes on your portfolio.

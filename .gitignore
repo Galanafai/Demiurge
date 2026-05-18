@@ -226,3 +226,12 @@ artifacts/*.tar
 artifacts/*.wds
 # Drake temporary files
 drake_visualizer_*.json
+
+# Heavy run outputs - stored on pod disk or W&B, not GitHub
+checkpoints/
+artifacts/eval_v1/
+artifacts/denoising_frames/
+artifacts/denoising_demo.mp4
+artifacts/ug_sweep_v2/*.json
+artifacts/ug_smoke/run_*.json
+artifacts/gallery/

@@ -104,6 +104,50 @@ _DEFAULT_MIN_SEPARATION_M: float = 0.06
 # Maximum rejection attempts per object placement before giving up.
 _MAX_PLACEMENT_ATTEMPTS: int = 60
 
+# Approach corridor radius in XY plane (metres). Objects placed outside this
+# cylinder from the robot-base-to-goal line have a clear arm sweep path.
+# APPROX: models a cylindrical exclusion zone around the arm's primary swing
+# plane. True arm swept volume is not cylindrical, but this is a cheap proxy
+# that significantly reduces RRT failures from blocked approach paths.
+_APPROACH_CORRIDOR_RADIUS_M: float = 0.18
+
+
+def _in_approach_corridor(
+    xy: np.ndarray,
+    goal_xy: np.ndarray,
+    radius: float = _APPROACH_CORRIDOR_RADIUS_M,
+) -> bool:
+    """Return True if xy lies within `radius` of the segment from origin to goal_xy.
+
+    The robot base is welded to the world origin (0, 0). The arm's primary
+    approach path in the XY plane is the line from (0, 0) to the target
+    object's XY position. Placing obstacle objects inside this corridor
+    frequently causes RRT failures because the arm must swing through it
+    to reach the IK goal.
+
+    # APPROX: cylindrical exclusion in XY plane. True arm swept volume is
+    # not cylindrical; this is a proximity proxy that does not guarantee
+    # RRT success, but measurably reduces the dominant failure mode.
+
+    Args:
+        xy: 2D position to test (x, y).
+        goal_xy: Target object XY position (defines corridor end-point).
+        radius: Exclusion cylinder radius in metres.
+
+    Returns:
+        True if xy is inside the approach corridor and should be rejected.
+    """
+    origin = np.zeros(2)
+    seg = goal_xy - origin          # vector from base to goal in XY
+    seg_len_sq = float(np.dot(seg, seg))
+    if seg_len_sq < 1e-6:
+        return False
+    vec = xy - origin
+    t = float(np.dot(vec, seg) / seg_len_sq)
+    t = max(0.0, min(1.0, t))
+    closest = origin + t * seg
+    return float(np.linalg.norm(xy - closest)) < radius
+
 
 def _half_height(type_id: int, scale: float = 1.0) -> float:
     """Return the half-height (z-extent) for an object type at the given scale."""
@@ -284,32 +328,98 @@ class TabletopReachTemplate:
         quats = [_sample_orientation(type_ids[j], rng) for j in range(n)]
 
         b = self.bounds
-        xyzs, placed = _place_objects(
-            rng, n, type_ids, scales,
-            x_range=(b.x_min, b.x_max),
-            y_range=(b.y_min, b.y_max),
-            min_separation_m=self.min_separation_m,
-        )
 
-        # Resolve to placed objects only.
-        type_ids = [type_ids[i] for i in placed]
-        scales = [scales[i] for i in placed]
-        quats = [quats[i] for i in placed]
+        # Choose target index before placement so the corridor can be reserved.
+        target_local = int(rng.integers(0, n))
+        tgt_type = type_ids[target_local]
+        tgt_scale = scales[target_local]
+        tgt_hz = _half_height(tgt_type, tgt_scale)
 
-        # Target: random present object.
-        target_local = int(rng.integers(0, len(type_ids)))
-        target_xyz = xyzs[target_local]
+        # Place target first at a random valid position.
+        tgt_placed = False
+        tgt_xy = np.zeros(2)
+        for _ in range(_MAX_PLACEMENT_ATTEMPTS):
+            x = float(rng.uniform(b.x_min + 0.05, b.x_max - 0.05))
+            y = float(rng.uniform(b.y_min + 0.05, b.y_max - 0.05))
+            tgt_xy = np.array([x, y])
+            tgt_placed = True
+            break
+        if not tgt_placed:
+            tgt_xy = np.array([0.0, 0.3])
+        tgt_xyz = np.array([tgt_xy[0], tgt_xy[1], tgt_hz])
+
+        # Place obstacle objects outside the approach corridor.
+        placed_xyzs: list[np.ndarray] = [None] * n  # type: ignore[list-item]
+        placed_xyzs[target_local] = tgt_xyz
+        placed_xy: list[np.ndarray] = [tgt_xy]
+
+        for i in range(n):
+            if i == target_local:
+                continue
+            hz = _half_height(type_ids[i], scales[i])
+            br = _bounding_radius(type_ids[i], scales[i])
+            eff_sep = max(self.min_separation_m, br * 1.2)
+            placed = False
+            for _ in range(_MAX_PLACEMENT_ATTEMPTS):
+                x = float(rng.uniform(b.x_min + 0.05, b.x_max - 0.05))
+                y = float(rng.uniform(b.y_min + 0.05, b.y_max - 0.05))
+                xy = np.array([x, y])
+                if (
+                    all(np.linalg.norm(xy - prev) >= eff_sep for prev in placed_xy)
+                    and not _in_approach_corridor(xy, tgt_xy)
+                ):
+                    placed_xy.append(xy)
+                    placed_xyzs[i] = np.array([x, y, hz])
+                    placed = True
+                    break
+            if not placed:
+                # Fallback: place without corridor constraint to avoid dropping objects.
+                for _ in range(_MAX_PLACEMENT_ATTEMPTS):
+                    x = float(rng.uniform(b.x_min + 0.05, b.x_max - 0.05))
+                    y = float(rng.uniform(b.y_min + 0.05, b.y_max - 0.05))
+                    xy = np.array([x, y])
+                    if all(np.linalg.norm(xy - prev) >= eff_sep for prev in placed_xy):
+                        placed_xy.append(xy)
+                        placed_xyzs[i] = np.array([x, y, hz])
+                        placed = True
+                        break
+            if not placed:
+                # Drop object if placement fails entirely.
+                placed_xyzs[i] = None  # type: ignore[assignment]
+
+        # Filter out dropped objects.
+        final_types, final_xyzs, final_scales, final_quats = [], [], [], []
+        new_target = 0
+        for i in range(n):
+            if placed_xyzs[i] is not None:
+                if i == target_local:
+                    new_target = len(final_types)
+                final_types.append(type_ids[i])
+                final_xyzs.append(placed_xyzs[i])
+                final_scales.append(scales[i])
+                final_quats.append(quats[i])
+
+        if not final_types:
+            # Absolute fallback: single object at workspace centre.
+            final_types = [type_ids[0]]
+            hz = _half_height(type_ids[0], scales[0])
+            final_xyzs = [np.array([0.0, 0.3, hz])]
+            final_scales = [scales[0]]
+            final_quats = [quats[0]]
+            new_target = 0
+
+        target_xyz = final_xyzs[new_target]
         goal_xyz = np.array([
             target_xyz[0],
             target_xyz[1],
             target_xyz[2] + _IK_GOAL_HEIGHT_M,
         ])
 
-        scene = _build_scene_tensor(type_ids, xyzs, scales, quats)
+        scene = _build_scene_tensor(final_types, final_xyzs, final_scales, final_quats)
         return CandidateScene(
             scene=scene,
             task_family=self.name,
-            target_idx=target_local,
+            target_idx=new_target,
             goal_xyz=goal_xyz,
         )
 
@@ -367,32 +477,81 @@ class ClutteredPickTemplate:
         scales = [float(rng.uniform(0.8, 1.1)) for _ in range(n)]
         quats = [_sample_orientation(type_ids[j], rng) for j in range(n)]
 
-        xyzs, placed = _place_objects(
-            rng, n, type_ids, scales,
-            x_range=self.cluster_x,
-            y_range=self.cluster_y,
-            min_separation_m=self.min_separation_m,
-            margin=0.04,
-        )
+        # Place target first inside the cluster region.
+        target_local_orig = int(rng.integers(0, n))
+        tgt_type = type_ids[target_local_orig]
+        tgt_scale = scales[target_local_orig]
+        tgt_hz = _half_height(tgt_type, tgt_scale)
+        tgt_x = float(rng.uniform(self.cluster_x[0], self.cluster_x[1]))
+        tgt_y = float(rng.uniform(self.cluster_y[0], self.cluster_y[1]))
+        tgt_xy = np.array([tgt_x, tgt_y])
+        tgt_xyz = np.array([tgt_x, tgt_y, tgt_hz])
 
-        type_ids = [type_ids[i] for i in placed]
-        scales = [scales[i] for i in placed]
-        quats = [quats[i] for i in placed]
+        placed_xyzs: list[np.ndarray] = [None] * n  # type: ignore[list-item]
+        placed_xyzs[target_local_orig] = tgt_xyz
+        placed_xy: list[np.ndarray] = [tgt_xy]
 
-        # Target: random present object.
-        target_local = int(rng.integers(0, len(type_ids)))
-        target_xyz = xyzs[target_local]
+        for i in range(n):
+            if i == target_local_orig:
+                continue
+            hz = _half_height(type_ids[i], scales[i])
+            br = _bounding_radius(type_ids[i], scales[i])
+            eff_sep = max(self.min_separation_m, br * 1.2)
+            placed = False
+            for _ in range(_MAX_PLACEMENT_ATTEMPTS):
+                x = float(rng.uniform(self.cluster_x[0] + 0.04, self.cluster_x[1] - 0.04))
+                y = float(rng.uniform(self.cluster_y[0] + 0.04, self.cluster_y[1] - 0.04))
+                xy = np.array([x, y])
+                if (
+                    all(np.linalg.norm(xy - prev) >= eff_sep for prev in placed_xy)
+                    and not _in_approach_corridor(xy, tgt_xy)
+                ):
+                    placed_xy.append(xy)
+                    placed_xyzs[i] = np.array([x, y, hz])
+                    placed = True
+                    break
+            if not placed:
+                for _ in range(_MAX_PLACEMENT_ATTEMPTS):
+                    x = float(rng.uniform(self.cluster_x[0] + 0.04, self.cluster_x[1] - 0.04))
+                    y = float(rng.uniform(self.cluster_y[0] + 0.04, self.cluster_y[1] - 0.04))
+                    xy = np.array([x, y])
+                    if all(np.linalg.norm(xy - prev) >= eff_sep for prev in placed_xy):
+                        placed_xy.append(xy)
+                        placed_xyzs[i] = np.array([x, y, hz])
+                        placed = True
+                        break
+
+        final_types, final_xyzs, final_scales, final_quats = [], [], [], []
+        new_target = 0
+        for i in range(n):
+            if placed_xyzs[i] is not None:
+                if i == target_local_orig:
+                    new_target = len(final_types)
+                final_types.append(type_ids[i])
+                final_xyzs.append(placed_xyzs[i])
+                final_scales.append(scales[i])
+                final_quats.append(quats[i])
+
+        if not final_types:
+            final_types = [type_ids[0]]
+            hz = _half_height(type_ids[0], scales[0])
+            final_xyzs = [np.array([self.cluster_x[0] + 0.10, self.cluster_y[0] + 0.10, hz])]
+            final_scales = [scales[0]]
+            final_quats = [quats[0]]
+            new_target = 0
+
+        target_xyz = final_xyzs[new_target]
         goal_xyz = np.array([
             target_xyz[0],
             target_xyz[1],
             target_xyz[2] + _IK_GOAL_HEIGHT_M,
         ])
 
-        scene = _build_scene_tensor(type_ids, xyzs, scales, quats)
+        scene = _build_scene_tensor(final_types, final_xyzs, final_scales, final_quats)
         return CandidateScene(
             scene=scene,
             task_family=self.name,
-            target_idx=target_local,
+            target_idx=new_target,
             goal_xyz=goal_xyz,
         )
 

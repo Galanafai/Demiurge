@@ -33,7 +33,7 @@ on a scale of 1-5:
 Respond ONLY with valid JSON: {"score": N, "reasoning": "..."}
 Keep reasoning under 80 words."""
 
-MODEL_ID = "claude-haiku-4-5"
+MODEL_ID = "claude-haiku-4-5-20251001"
 
 
 def _strip_fences(text: str) -> str:
