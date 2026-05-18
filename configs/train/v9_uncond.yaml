@@ -40,7 +40,10 @@ loss:
 
 dataset:
   path: data/combined
-  hash: ""                  # skip hash check - combined dir uses symlinks
+  hash: ""
+  num_workers: 32
+  persistent_workers: true
+  prefetch_factor: 4
 
 text_conditioning: false
 
