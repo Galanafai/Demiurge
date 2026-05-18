@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 import yaml
 from tqdm import tqdm
 
@@ -59,9 +60,68 @@ from data.sampler import (  # noqa: E402
 )
 from data.writer import ShardWriter  # noqa: E402
 from scene.schema import WorkspaceBounds  # noqa: E402
+from scene.vocab import OBJECT_VOCAB  # noqa: E402
 from validator.core import SceneValidator, ValidityReport  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bounding-sphere pre-filter
+# ---------------------------------------------------------------------------
+
+# Precomputed bounding radii for each object type ID.
+# APPROX: uses spherical bounding volumes; actual geometry may be non-spherical
+# (cylinders, tall boxes). This is a conservative over-approximation: no false
+# negatives (scenes that pass pre-filter are not guaranteed to pass Drake), but
+# reduces Drake call volume by rejecting clear overlaps cheaply.
+_BOUNDING_RADII: torch.Tensor = torch.tensor(
+    [OBJECT_VOCAB[i].bounding_radius_m for i in range(len(OBJECT_VOCAB))],
+    dtype=torch.float32,
+)
+
+# Scale safety margin: reject if centres are closer than sum_of_radii * MARGIN.
+# 0.90 means we require 10% clearance beyond the bounding sphere. This trades
+# a small false-positive rate (a few physically valid scenes rejected) for
+# higher filter selectivity.
+_PREFILTER_MARGIN: float = 0.90
+
+
+def _bounding_sphere_prefilter(candidate: "CandidateScene") -> bool:
+    """O(N^2) bounding-sphere overlap check. Runs in the main process.
+
+    Returns True if the scene should be sent to Drake (no obvious overlap).
+    Returns False to discard without Drake validation.
+
+    # APPROX: bounding_radius_m from OBJECT_VOCAB -- spherical over-approximation
+    #         of each object's true collision geometry. Non-interpenetrating scenes
+    #         that pass this filter may still fail Drake's exact collision check.
+    """
+    scene = candidate.scene
+    pres = scene.presence  # (N_MAX,) bool
+    n_present = int(pres.sum().item())
+    if n_present < 2:
+        return True  # single object: trivially no pairwise overlap
+
+    # Extract positions and type IDs for present objects only.
+    xyz = scene.poses[pres, :3]  # (n_present, 3)
+    type_ids = scene.object_types[pres]  # (n_present,)
+    scale_mean = scene.scales[pres].mean(dim=1)  # (n_present,) scalar scale
+
+    # Scale-adjusted bounding radii.
+    radii = _BOUNDING_RADII[type_ids] * scale_mean  # (n_present,)
+
+    # Pairwise distance matrix.
+    # cdist on CPU with n_present <= 12 is ~2µs.
+    dists = torch.cdist(xyz, xyz)  # (n_present, n_present)
+
+    # Minimum allowed separation for each pair.
+    min_sep = (radii.unsqueeze(0) + radii.unsqueeze(1)) * _PREFILTER_MARGIN
+
+    # Mask diagonal (self-pairs).
+    eye = torch.eye(n_present, dtype=torch.bool)
+    overlap = (dists < min_sep) & ~eye
+
+    return not overlap.any().item()
 
 # ---------------------------------------------------------------------------
 # Per-worker state (initialised once per process)
@@ -438,10 +498,24 @@ def main() -> int:
                 int(rrt_rng.integers(0, 2**31)) for _ in batch
             ]
 
+            # Apply O(N^2) bounding-sphere pre-filter in the main process.
+            # Discards candidates with obvious pairwise overlap before Drake.
+            # Filtered candidates count as attempts (they would fail no_interp).
+            prefilter_passed: list[CandidateScene] = []
+            prefilter_seeds: list[int] = []
+            for cand, seed_ in zip(batch, rrt_seeds):
+                if _bounding_sphere_prefilter(cand):
+                    prefilter_passed.append(cand)
+                    prefilter_seeds.append(seed_)
+                else:
+                    # Count as a Drake attempt that would have failed interpenetration.
+                    template_attempts[cand.task_family] += 1
+                    total_attempts += 1
+
             # Submit and collect results.
             future_to_candidate = {
                 executor.submit(_validate_task, (c, s)): c
-                for c, s in zip(batch, rrt_seeds)
+                for c, s in zip(prefilter_passed, prefilter_seeds)
             }
 
             for future in concurrent.futures.as_completed(future_to_candidate):
