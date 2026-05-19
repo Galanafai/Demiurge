@@ -155,6 +155,11 @@ def main() -> None:
              "smooth monotone tradeoff between validity and text-following.",
     )
     p.add_argument("--out", default=None, help="JSON output path")
+    p.add_argument(
+        "--presence-threshold", type=float, default=0.0,
+        help="Logit threshold for presence decode. Default 0.0 (sigmoid>0.5). "
+             "Use negative values (e.g. -0.589) to match training-data occupancy.",
+    )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -260,7 +265,7 @@ def main() -> None:
             pres_bit = x_cont[:, :, 12]
 
             for i in range(b):
-                pres_mask = pres_bit[i] > 0.0
+                pres_mask = pres_bit[i] > args.presence_threshold  # calibrated threshold
                 quats = rot6d_to_quat_wxyz(rot6d_pred[i])
                 poses_raw = torch.cat([xyz[i], quats], dim=-1)
                 st_norm = SceneTensor(
