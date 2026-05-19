@@ -303,6 +303,7 @@ class DDIMSampler:
         schedule: CosineSchedule,
         n_steps: int = 50,
         eta: float = 0.0,
+        prediction_type: str = "epsilon",
     ) -> None:
         if prediction_type not in ("epsilon", "v"):
             raise ValueError(f"prediction_type must be epsilon or v, got {prediction_type!r}")
@@ -381,13 +382,17 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
-            # Predicted x_0.
-            # Clamp x0_pred to prevent explosion when ab_t is near zero
-            # (e.g. t=T-1 where alpha_bar ~ 5e-8 on the cosine schedule).
-            # Normalised scene values live in roughly [-2, 2]; the ±10 range
-            # is generous but prevents catastrophic amplification while still
-            # allowing the model to express the full dynamic range.
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            # Predicted x_0 and eps.
+            # Branch on prediction_type so v-prediction models are handled
+            # correctly. Using epsilon formula on a v-prediction model causes
+            # output explosion (v5 failure: std=5.32, 0% Drake validity).
+            if self.prediction_type == "v":
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                # Epsilon prediction (original formula).
+                # Clamp to prevent explosion when ab_t is near zero.
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             # Direction pointing to x_t (eta=0 term is zero; kept for clarity).
@@ -508,7 +513,13 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            # Branch on prediction_type: v-prediction or epsilon.
+            # Using epsilon formula on v-prediction model causes output explosion.
+            if self.prediction_type == "v":
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (

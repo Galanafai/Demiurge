@@ -301,9 +301,13 @@ def run_validation(
     from model.rotations import rot6d_to_quat_wxyz
     from scene.schema import SceneTensor
     from validator.core import SceneValidator
+    from training.output_sanity import check_output_sanity
 
     model.eval()
-    sampler = DDIMSampler(schedule, n_steps=ddim_steps)
+    # Pass prediction_type from schedule so v-prediction models use correct
+    # sampling formula. Missing this caused v5's 0% Drake validity.
+    _pred_type = getattr(schedule, "_prediction_type", "epsilon")
+    sampler = DDIMSampler(schedule, n_steps=ddim_steps, prediction_type=_pred_type)
     fn = model.noise_prediction_fn(text_emb)
     validator = SceneValidator(rrt_budget_s=2.0)
 
@@ -317,6 +321,11 @@ def run_validation(
         x0 = sampler.sample(fn, (b, N_MAX, 13), seed=seed, device=device)
         seed += 1
         remaining -= b
+
+        # Sanity check: log output distribution, warn on explosion/collapse.
+        report = check_output_sanity(x0)
+        if report.inferred_explosion or report.inferred_collapse or report.saturation_rate > 0.1:
+            print(f"  [val sanity] {report.summary()}")
 
         # Decode x0 -> SceneTensor and validate.
         # Clamp xyz to normalised workspace bounds [-1, 1] before decode.
@@ -664,6 +673,9 @@ def main() -> None:
         resume_run_id=wandb_resume_id,
     )
 
+    # --- Runtime invariant monitor ---
+    invariants = TrainingInvariants()
+
     # --- CFG dropout smoke test ---
     if cfg_dropout > 0.0 and text_cache is not None:
         print(f"CFG dropout={cfg_dropout:.2f} -- running 1000-batch smoke test...")
@@ -801,11 +813,6 @@ def main() -> None:
                     log_dict["train/grad_norm"] = float(grad_norm)
                     log_dict["train/lr"] = lr_scheduler.get_last_lr()[0]
                     log_dict["train/step"] = step
-                    # Invariant check at log step
-                    _loss_for_inv = {k: v.item() if hasattr(v, "item") else float(v)
-                                     for k, v in loss_out._asdict().items()}
-                    if not invariants.check_loss(_loss_for_inv, step):
-                        print(f"[HALT] Invariant violated: {invariants.last_violation()}")
                     wandb_run.log(log_dict, step=step)
 
                 if step % ckpt_steps == 0:

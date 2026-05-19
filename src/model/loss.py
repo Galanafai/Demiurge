@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from model.presence_loss import presence_bce_balanced, PRESENCE_POS_WEIGHT
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -175,8 +176,13 @@ class SceneDiffusionLoss(torch.nn.Module):
         # pred.presence_logit: (B, N_MAX, 1); eps_presence used as target proxy
         # here we use the CLEAN presence mask as the target (not the noisy bit).
         pres_target = presence_mask.float().unsqueeze(-1)                   # (B, N_MAX, 1)
-        loss_pres = F.binary_cross_entropy_with_logits(
-            pred.presence_logit, pres_target, reduction="mean"
+        # Use class-balanced BCE (pos_weight=3.10) to prevent presence collapse.
+        # Plain BCE with occupancy=0.244 biases the model toward predicting all-absent,
+        # which caused v5's presence collapse (27.6% -> 16.1% active over 30k steps).
+        loss_pres = presence_bce_balanced(
+            pred.presence_logit.squeeze(-1),  # (B, N_MAX)
+            pres_target.squeeze(-1),          # (B, N_MAX)
+            pos_weight=PRESENCE_POS_WEIGHT,
         )
 
         total = (
