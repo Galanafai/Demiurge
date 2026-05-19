@@ -112,10 +112,12 @@ def _validate_worker(args_tuple: tuple) -> dict:
         scales=st_dict["scales"],
         presence=st_dict["presence"],
     )
-    bounds = WorkspaceBounds.default()
-    st_phys = st.denormalize(bounds)
+    # BUG FIX: SceneTensor is already in the coordinate space expected by
+    # SceneValidator (data is stored in physical units by the sampler).
+    # Calling denormalize() here was double-converting coordinates and
+    # causing ALL probes to report 0% Drake validity across v1/v2/v3.
     validator = SceneValidator(rrt_budget_s=rrt_budget)
-    rpt = validator.validate(st_phys)
+    rpt = validator.validate(st)
     return {
         "accepted": rpt.accepted,
         "no_interpenetration": rpt.no_interpenetration,
