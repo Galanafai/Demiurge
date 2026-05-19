@@ -680,7 +680,7 @@ def _populate_plant_with_scene(
             for body_idx in plant.GetBodyIndices(mi):  # type: ignore[attr-defined]
                 body = plant.get_body(body_idx)  # type: ignore[attr-defined]
                 if body.name() == "link":
-                    plant.SetDefaultFloatingBaseBodyPose(body, X_WB)  # type: ignore[attr-defined]
+                    plant.SetDefaultFreeBodyPose(body, X_WB)  # type: ignore[attr-defined]
                     body_indices.append(body_idx)
 
     return body_indices
