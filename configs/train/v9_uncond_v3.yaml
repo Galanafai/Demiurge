@@ -1,0 +1,61 @@
+# v9 unconditional v3 -- FRESH FROM SCRATCH
+# Lessons from v1 (type_ce=0 due to type_grad_isolation shortcut)
+# and v2 (warm-init could not escape poisoned z prior from 150k bad steps).
+# All architectural fixes applied from step 0. Moderate loss weights.
+# Field names match scripts/train.py exactly.
+
+model:
+  n_layers: 16
+  d_model: 384
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: false   # FIX: false prevents type head memorization
+  use_slot_id_embed: true
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  max_steps: 150000
+  batch_size: 64
+  lr: 3.0e-4            # full learning rate -- no warm-init
+  warmup_steps: 2000
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  gradient_accumulation: 1
+  checkpoint_steps: 10000
+  val_every_epochs: 1
+  val_n_scenes: 100
+  weighted_sampling: false
+  dtype: float32
+  log_every_steps: 100
+  cfg_dropout: 0.0
+  warm_init_from: null               # FROM SCRATCH
+  use_discrete_type_diffusion: true  # FIX: noisy types prevent input memorization
+
+loss:
+  pose_xyz: 2.0      # moderate (v1=1.0 weak, v2=5.0 overcorrected z)
+  pose_rot: 1.0
+  scale: 0.5
+  type_ce: 1.0       # moderate (v1=0.1 zero-gradient, v2=2.0)
+  presence_bce: 0.3  # moderate (v1=0.05 uncalibrated, v2=1.0 too sparse)
+
+dataset:
+  path: data/combined
+  hash: ""
+  num_workers: 32
+  persistent_workers: true
+  prefetch_factor: 4
+
+text_conditioning: false
+
+wandb:
+  enabled: true
+  project: demiurge
+  experiment: v9_uncond_v3_scratch
+  tags: [v9, uncond, scratch, 49M, 234k, type-grad-fix, moderate-weights]
+
+output:
+  dir: checkpoints/v9_uncond_v3
