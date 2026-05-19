@@ -118,10 +118,10 @@ class SceneDiffusionLoss(torch.nn.Module):
     def forward(
         self,
         pred: DenoiserOutput,
-        eps_xyz: Tensor,
-        eps_rot6d: Tensor,
-        eps_scale: Tensor,
-        eps_presence: Tensor,
+        target_xyz: Tensor,
+        target_rot6d: Tensor,
+        target_scale: Tensor,
+        target_presence: Tensor,
         target_type_ids: Tensor,
         presence_mask: Tensor,
     ) -> LossOutput:
@@ -129,10 +129,10 @@ class SceneDiffusionLoss(torch.nn.Module):
 
         Args:
             pred: Raw model output from SceneDenoiser.forward().
-            eps_xyz: Ground-truth noise for XYZ. Shape: (B, N_MAX, 3).
-            eps_rot6d: Ground-truth noise for 6D rotation. Shape: (B, N_MAX, 6).
-            eps_scale: Ground-truth noise for scale. Shape: (B, N_MAX, 3).
-            eps_presence: Ground-truth noise for presence bit. Shape: (B, N_MAX, 1).
+            target_xyz: Regression target for XYZ (eps or v). Shape: (B, N_MAX, 3).
+            target_rot6d: Regression target for 6D rotation. Shape: (B, N_MAX, 6).
+            target_scale: Regression target for scale. Shape: (B, N_MAX, 3).
+            target_presence: Regression target for presence. Shape: (B, N_MAX, 1).
             target_type_ids: True object type IDs (from clean scene).
                 Shape: (B, N_MAX), dtype=long.
             presence_mask: Boolean mask of occupied slots in the CLEAN scene.
@@ -148,15 +148,15 @@ class SceneDiffusionLoss(torch.nn.Module):
         n_present = mask.sum().clamp(min=1.0)  # avoid division by zero
 
         # --- XYZ MSE (present slots only) ---
-        xyz_err = ((pred.xyz - eps_xyz) ** 2).sum(dim=-1)        # (B, N_MAX)
+        xyz_err = ((pred.xyz - target_xyz) ** 2).sum(dim=-1)        # (B, N_MAX)
         loss_xyz = (xyz_err * mask).sum() / n_present
 
         # --- Rotation 6D MSE (present slots only) ---
-        rot_err = ((pred.rot6d - eps_rot6d) ** 2).sum(dim=-1)    # (B, N_MAX)
+        rot_err = ((pred.rot6d - target_rot6d) ** 2).sum(dim=-1)    # (B, N_MAX)
         loss_rot = (rot_err * mask).sum() / n_present
 
         # --- Scale MSE (present slots only) ---
-        scale_err = ((pred.scale - eps_scale) ** 2).sum(dim=-1)  # (B, N_MAX)
+        scale_err = ((pred.scale - target_scale) ** 2).sum(dim=-1)  # (B, N_MAX)
         loss_scale = (scale_err * mask).sum() / n_present
 
         # --- Type cross-entropy (present slots only) ---

@@ -40,6 +40,12 @@ from model.schedule import CosineSchedule, DDIMSampler  # noqa: E402
 from model.text_encoder import TextEncoder  # noqa: E402
 from scene.schema import N_MAX, SceneTensor, WorkspaceBounds  # noqa: E402
 from validator.core import SceneValidator  # noqa: E402
+import torch as _torch
+_DATA_MEAN_XYZ   = _torch.tensor([-0.049867, +0.378790, -0.751155])
+_DATA_STD_XYZ    = _torch.tensor([+0.419080, +0.457588, +0.127651])
+_DATA_MEAN_SCALE = _torch.tensor([-0.038706, -0.038706, -0.038706])
+_DATA_STD_SCALE  = _torch.tensor([+0.221619, +0.221619, +0.221619])
+
 
 # ── Held-out description templates (same as probe_vlm.py) ─────────────────────
 _HELD_OUT_TEMPLATES = [

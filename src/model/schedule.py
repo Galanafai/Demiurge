@@ -44,9 +44,11 @@ class CosineSchedule:
         T: int = 1000,
         s: float = 0.008,
         clip_beta_max: float = 0.999,
+        zero_terminal_snr: bool = False,
     ) -> None:
         self.T = T
         self.s = s
+        self.zero_terminal_snr = zero_terminal_snr
 
         # Build alpha_bar for all t in [0, T] (T+1 values; index 0 is
         # the "clean" state before any noise is added).
@@ -61,6 +63,18 @@ class CosineSchedule:
 
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)  # shape: (T,)
+
+        if zero_terminal_snr:
+            # Lin et al. 2024: rescale sqrt(alpha_bar) so terminal = 0 exactly.
+            sqrt_ab = alpha_bar.sqrt()
+            sqrt_ab_0 = sqrt_ab[0].clone()
+            sqrt_ab_T = sqrt_ab[-1].clone()
+            sqrt_ab = sqrt_ab - sqrt_ab_T
+            sqrt_ab = sqrt_ab * sqrt_ab_0 / (sqrt_ab_0 - sqrt_ab_T)
+            alpha_bar = sqrt_ab ** 2
+            alpha_bar_full = torch.cat([torch.ones(1, dtype=torch.float64), alpha_bar])
+            betas = 1.0 - alpha_bar_full[1:] / alpha_bar_full[:-1]
+            betas = betas.clamp(0.0, clip_beta_max)
 
         # Prepend 1.0 so that alpha_bar_prev[0] = 1.0 (no noise at t=-1).
         alpha_bar_prev = torch.cat([torch.ones(1, dtype=torch.float64), alpha_bar[:-1]])
@@ -158,6 +172,30 @@ class CosineSchedule:
         sqrt_1mab = self.sqrt_one_minus_alpha_bar(t).view(view_shape).to(x_t.device)
 
         return (x_t - sqrt_1mab * eps_pred) / sqrt_ab.clamp(min=1e-8)
+
+    def predict_x0_from_v(self, x_t, t, v_pred):
+        """x0 = sqrt(ab)*x_t - sqrt(1-ab)*v"""
+        ed = x_t.dim() - 1
+        vs = (-1,) + (1,) * ed
+        sa = self.sqrt_alpha_bar(t).view(vs).to(x_t.device)
+        s1 = self.sqrt_one_minus_alpha_bar(t).view(vs).to(x_t.device)
+        return sa * x_t - s1 * v_pred
+
+    def predict_eps_from_v(self, x_t, t, v_pred):
+        """eps = sqrt(1-ab)*x_t + sqrt(ab)*v"""
+        ed = x_t.dim() - 1
+        vs = (-1,) + (1,) * ed
+        sa = self.sqrt_alpha_bar(t).view(vs).to(x_t.device)
+        s1 = self.sqrt_one_minus_alpha_bar(t).view(vs).to(x_t.device)
+        return s1 * x_t + sa * v_pred
+
+    def compute_v_target(self, x0, eps, t):
+        """v = sqrt(ab)*eps - sqrt(1-ab)*x0"""
+        ed = x0.dim() - 1
+        vs = (-1,) + (1,) * ed
+        sa = self.sqrt_alpha_bar(t).view(vs).to(x0.device)
+        s1 = self.sqrt_one_minus_alpha_bar(t).view(vs).to(x0.device)
+        return sa * eps - s1 * x0
 
     def type_corruption_prob(self, t_idx: Tensor) -> Tensor:
         """Corruption probability for discrete type diffusion.
@@ -266,9 +304,12 @@ class DDIMSampler:
         n_steps: int = 50,
         eta: float = 0.0,
     ) -> None:
+        if prediction_type not in ("epsilon", "v"):
+            raise ValueError(f"prediction_type must be epsilon or v, got {prediction_type!r}")
         self.schedule = schedule
         self.n_steps = n_steps
         self.eta = eta
+        self.prediction_type = prediction_type
 
         T = schedule.T
         # Select n_steps evenly-spaced timesteps from T-1 down to 0.

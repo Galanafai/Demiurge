@@ -29,6 +29,18 @@ from model.loss import LossWeights, SceneDiffusionLoss  # noqa: E402
 from model.rotations import quat_wxyz_to_6d  # noqa: E402
 from model.schedule import CosineSchedule, DDIMSampler, corrupt_type_ids  # noqa: E402
 from scene.schema import N_MAX, WorkspaceBounds  # noqa: E402
+from training.invariants import TrainingInvariants, log_output_stats  # noqa: E402
+# ---------------------------------------------------------------------------
+# Per-dim whitening constants (v5, measured from 28930 objects, v1+v2 dataset)
+# Encode: x_white = (x_norm - mean) / std
+# Decode: x_norm = x_white * std + mean  then call denormalize()
+# z_std=0.1277 is 3x smaller than x_std=0.4191 -- the covariance mismatch.
+# ---------------------------------------------------------------------------
+_DATA_MEAN_XYZ   = torch.tensor([-0.049867, +0.378790, -0.751155])
+_DATA_STD_XYZ    = torch.tensor([+0.419080, +0.457588, +0.127651])
+_DATA_MEAN_SCALE = torch.tensor([-0.038706, -0.038706, -0.038706])
+_DATA_STD_SCALE  = torch.tensor([+0.221619, +0.221619, +0.221619])
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -232,9 +244,9 @@ def _scene_to_cont(scene: Any, bounds: WorkspaceBounds) -> torch.Tensor:
     Normalised to workspace bounds before packing.
     """
     s = scene.normalize(bounds)
-    xyz = s.poses[:, :3]                          # (N_MAX, 3)
-    rot6d = quat_wxyz_to_6d(s.poses[:, 3:7])      # (N_MAX, 6)
-    scale = s.scales                               # (N_MAX, 3)
+    xyz   = (s.poses[:, :3] - _DATA_MEAN_XYZ) / _DATA_STD_XYZ
+    rot6d = quat_wxyz_to_6d(s.poses[:, 3:7])
+    scale = (s.scales - _DATA_MEAN_SCALE) / _DATA_STD_SCALE
     pres = s.presence.float().unsqueeze(-1)        # (N_MAX, 1)
     return torch.cat([xyz, rot6d, scale, pres], dim=-1)  # (N_MAX, 13)
 
@@ -311,11 +323,12 @@ def run_validation(
         # DDIM accumulation can drift marginally outside this range even with
         # the x0_pred clamp; applying it here prevents Drake from receiving
         # physically impossible coordinates (e.g. y=-0.51m outside workspace).
-        xyz = x0[:, :, :3].clamp(-1.0, 1.0)
+        # Inverse whitening: x_norm = x_white * std + mean
+        xyz = (x0[:, :, :3] * _DATA_STD_XYZ.to(device) + _DATA_MEAN_XYZ.to(device)).clamp(-1.0, 1.0)
         rot6d_pred = x0[:, :, 3:9]
         # Normalised scale range: (physical - 1.0) / 0.5, so physical [0.5, 1.5]
         # maps to normalised [-1.0, 1.0]. Clamp in normalised space.
-        scale_pred = x0[:, :, 9:12].clamp(-1.0, 1.0)
+        scale_pred = (x0[:, :, 9:12] * _DATA_STD_SCALE.to(device) + _DATA_MEAN_SCALE.to(device)).clamp(-1.0, 1.0)
         pres_bit = x0[:, :, 12]
 
         for i in range(b):
@@ -380,7 +393,11 @@ def main() -> None:
     dcfg_diff = cfg.get("diffusion", {})
     T = int(dcfg_diff.get("T", 1000))
     ddim_steps = int(dcfg_diff.get("ddim_steps", 50))
-    schedule = CosineSchedule(T=T)
+    prediction_type: str = dcfg_diff.get("prediction_type", "epsilon")
+    zero_terminal_snr: bool = bool(dcfg_diff.get("zero_terminal_snr", False))
+    schedule = CosineSchedule(T=T, zero_terminal_snr=zero_terminal_snr)
+    print(f"Schedule: T={T}, zero_terminal_snr={zero_terminal_snr}, prediction_type={prediction_type}")
+    print(f"  alpha_bar[0]={schedule._alpha_bar[0]:.6f}  alpha_bar[-1]={schedule._alpha_bar[-1]:.2e}")
 
     # --- Training config ---
     tcfg = cfg.get("training", {})
@@ -578,7 +595,7 @@ def main() -> None:
 
     # --- Optimizer + LR schedule ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None  # type: ignore[attr-defined]
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     def _lr_lambda(step: int) -> float:
         if step < warmup_steps:
@@ -716,6 +733,16 @@ def main() -> None:
             eps_cont = torch.cat([eps_xyz, eps_rot, eps_scale, eps_pres], dim=-1)
             x_noisy, _ = schedule.add_noise(x_cont, t_idx, eps_cont)
 
+            if prediction_type == "v":
+                v_cont = schedule.compute_v_target(x_cont, eps_cont, t_idx)
+                target_xyz, target_rot = v_cont[:, :, :3], v_cont[:, :, 3:9]
+                target_scale, target_pres = v_cont[:, :, 9:12], v_cont[:, :, 12:13]
+            else:
+                target_xyz   = eps_xyz
+                target_rot   = eps_rot
+                target_scale = eps_scale
+                target_pres  = eps_pres
+
             step_t0 = time.monotonic()
             import contextlib
             amp_ctx = torch.amp.autocast(device_type=device.type, dtype=amp_dtype) if use_amp else contextlib.nullcontext()
@@ -734,9 +761,13 @@ def main() -> None:
                 pred = model(x_noisy, type_ids_input, t_idx, text_emb_b)
                 loss_out = loss_fn(
                     pred,
-                    eps_xyz, eps_rot, eps_scale, eps_pres,
+                    target_xyz, target_rot, target_scale, target_pres,
                     type_ids, presence,
                 )
+                # --- Invariant checks ---
+                if step % 1000 == 0 and hasattr(pred, 'cont'):
+                    invariants.check_output(pred.cont.detach().cpu(), step)
+                    log_output_stats(pred.cont.detach().cpu(), step, run=wandb_run)
                 loss = loss_out.total / grad_accum
 
             if scaler is not None:
@@ -770,6 +801,11 @@ def main() -> None:
                     log_dict["train/grad_norm"] = float(grad_norm)
                     log_dict["train/lr"] = lr_scheduler.get_last_lr()[0]
                     log_dict["train/step"] = step
+                    # Invariant check at log step
+                    _loss_for_inv = {k: v.item() if hasattr(v, "item") else float(v)
+                                     for k, v in loss_out._asdict().items()}
+                    if not invariants.check_loss(_loss_for_inv, step):
+                        print(f"[HALT] Invariant violated: {invariants.last_violation()}")
                     wandb_run.log(log_dict, step=step)
 
                 if step % ckpt_steps == 0:
