@@ -59,7 +59,7 @@ class RejectionSampler:
         self._device = device or torch.device("cpu")
         self._seed = seed
         self._validator = SceneValidator(rrt_budget_s=rrt_budget_s)
-        self._sampler = DDIMSampler(schedule, n_steps=ddim_steps)
+        self._sampler = DDIMSampler(schedule, n_steps=ddim_steps, prediction_type=getattr(schedule, "_prediction_type", "epsilon"))
 
     # ------------------------------------------------------------------
     # Sampler protocol

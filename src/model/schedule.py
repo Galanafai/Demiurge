@@ -679,7 +679,11 @@ class DDIMSampler:
             ab_t_v = ab_t_v.view(view)
             ab_prev_v = ab_prev.view(view)
 
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            if self.prediction_type == "v":
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (
@@ -757,7 +761,11 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            if self.prediction_type == "v":
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (
