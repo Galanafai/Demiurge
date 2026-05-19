@@ -156,9 +156,17 @@ def main() -> None:
     )
     p.add_argument("--out", default=None, help="JSON output path")
     p.add_argument(
-        "--presence-threshold", type=float, default=0.0,
-        help="Logit threshold for presence decode. Default 0.0 (sigmoid>0.5). "
-             "Use negative values (e.g. -0.589) to match training-data occupancy.",
+        "--presence-threshold", type=float, default=-0.589,
+        help=(
+            "Logit threshold for the presence decode step. "
+            "The training dataset has 24.4%% slot occupancy (mean 2.93 objects "
+            "per 12-slot scene). The optimal logit threshold that reproduces this "
+            "occupancy at inference is log(0.244/0.756) = -1.13, but empirically "
+            "-0.589 matches the model output distribution at step 50k. "
+            "The old default of 0.0 (sigmoid > 0.5) decoded only ~12%% of slots "
+            "as present, causing false-sparse scenes and invalid Drake probes. "
+            "Set to 0.0 to recover the legacy behaviour."
+        ),
     )
     args = p.parse_args()
 
