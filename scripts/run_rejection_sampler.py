@@ -235,7 +235,7 @@ def main() -> None:
 
     model = load_model(Path(args.model_checkpoint), device)
     schedule = CosineSchedule(T=1000)
-    sampler = DDIMSampler(schedule, n_steps=DDIM_STEPS)
+    sampler = DDIMSampler(schedule, n_steps=DDIM_STEPS, prediction_type=getattr(schedule, "_prediction_type", "epsilon"))
     bounds = WorkspaceBounds.default()
     validator = SceneValidator(rrt_budget_s=args.rrt_budget)
 

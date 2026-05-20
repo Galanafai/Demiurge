@@ -29,6 +29,38 @@ from model.loss import LossWeights, SceneDiffusionLoss  # noqa: E402
 from model.rotations import quat_wxyz_to_6d  # noqa: E402
 from model.schedule import CosineSchedule, DDIMSampler, corrupt_type_ids  # noqa: E402
 from scene.schema import N_MAX, WorkspaceBounds  # noqa: E402
+from training.invariants import TrainingInvariants, log_output_stats  # noqa: E402
+# ---------------------------------------------------------------------------
+# Per-dim whitening constants (v5, measured from 28930 objects, v1+v2 dataset)
+# Encode: x_white = (x_norm - mean) / std
+# Decode: x_norm = x_white * std + mean  then call denormalize()
+# z_std=0.1277 is 3x smaller than x_std=0.4191 -- the covariance mismatch.
+# ---------------------------------------------------------------------------
+_DATA_MEAN_XYZ   = torch.tensor([-0.049867, +0.378790, -0.751155])
+_DATA_STD_XYZ    = torch.tensor([+0.419080, +0.457588, +0.127651])
+_DATA_MEAN_SCALE = torch.tensor([-0.038706, -0.038706, -0.038706])
+_DATA_STD_SCALE  = torch.tensor([+0.221619, +0.221619, +0.221619])
+
+
+# ---------------------------------------------------------------------------
+# Per-dim whitening constants (measured from combined dataset v1+v2, ~12k objects)
+#
+# After range-normalize to [-1, 1], the training data has non-zero mean AND
+# non-unit variance per dimension. Both conflict with the DDPM N(0,I) prior.
+# Full whitening: x_white = (x_norm - mean) / std  gives mean=0, std=1 per dim.
+#
+# Measured means (same as v4 zero-centering offsets):
+#   x: -0.049  y: +0.381  z: -0.753  (z has largest offset AND smallest std)
+# Measured stds (key: z_std << x_std, y_std -- the covariance mismatch root cause):
+#   x_std: ~0.41  y_std: ~0.20  z_std: ~0.10  scale_std: ~0.12
+#
+# INVARIANT: probe_drake.py and any other decode path MUST apply the inverse:
+#   x_norm = x_white * std + mean   before calling denormalize().
+# ---------------------------------------------------------------------------
+_DATA_MEAN_XYZ   = torch.tensor([-0.049867, +0.378790, -0.751155])  # (3,)
+_DATA_STD_XYZ    = torch.tensor([+0.419080, +0.457588, +0.127651])  # (3,) z_std is 3x smaller -- was the mismatch
+_DATA_MEAN_SCALE = torch.tensor([-0.038706, -0.038706, -0.038706])  # (3,)
+_DATA_STD_SCALE  = torch.tensor([+0.221619, +0.221619, +0.221619])  # (3,)
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -118,7 +150,7 @@ def _init_wandb(
     else:
         run = wandb.init(
             project=wcfg.get("project", "demiurge"),
-            name=wcfg.get("experiment", "unnamed"),
+            name=wcfg.get("run_name", wcfg.get("experiment", "unnamed")),
             tags=wcfg.get("tags", []),
             config={**run_cfg, "git_sha": git_sha},
         )
@@ -229,12 +261,15 @@ def _scene_to_cont(scene: Any, bounds: WorkspaceBounds) -> torch.Tensor:
     """Convert a SceneTensor to the (N_MAX, 13) continuous feature tensor.
 
     Layout: xyz(3) | rot6d(6) | scale(3) | presence_bit(1)
-    Normalised to workspace bounds before packing.
+
+    Full per-dim whitening: subtract mean and divide by std so the effective
+    training distribution has mean=0, std=1 per dimension, matching N(0,I).
+    Decode paths must invert: x_norm = x_white * std + mean before denormalize().
     """
     s = scene.normalize(bounds)
-    xyz = s.poses[:, :3]                          # (N_MAX, 3)
-    rot6d = quat_wxyz_to_6d(s.poses[:, 3:7])      # (N_MAX, 6)
-    scale = s.scales                               # (N_MAX, 3)
+    xyz   = (s.poses[:, :3] - _DATA_MEAN_XYZ) / _DATA_STD_XYZ
+    rot6d = quat_wxyz_to_6d(s.poses[:, 3:7])
+    scale = (s.scales - _DATA_MEAN_SCALE) / _DATA_STD_SCALE
     pres = s.presence.float().unsqueeze(-1)        # (N_MAX, 1)
     return torch.cat([xyz, rot6d, scale, pres], dim=-1)  # (N_MAX, 13)
 
@@ -289,9 +324,13 @@ def run_validation(
     from model.rotations import rot6d_to_quat_wxyz
     from scene.schema import SceneTensor
     from validator.core import SceneValidator
+    from training.output_sanity import check_output_sanity
 
     model.eval()
-    sampler = DDIMSampler(schedule, n_steps=ddim_steps)
+    # Pass prediction_type from schedule so v-prediction models use correct
+    # sampling formula. Missing this caused v5's 0% Drake validity.
+    _pred_type = getattr(schedule, "_prediction_type", "epsilon")
+    sampler = DDIMSampler(schedule, n_steps=ddim_steps, prediction_type=_pred_type)
     fn = model.noise_prediction_fn(text_emb)
     validator = SceneValidator(rrt_budget_s=2.0)
 
@@ -306,20 +345,26 @@ def run_validation(
         seed += 1
         remaining -= b
 
+        # Sanity check: log output distribution, warn on explosion/collapse.
+        report = check_output_sanity(x0)
+        if report.inferred_explosion or report.inferred_collapse or report.saturation_rate > 0.1:
+            print(f"  [val sanity] {report.summary()}")
+
         # Decode x0 -> SceneTensor and validate.
         # Clamp xyz to normalised workspace bounds [-1, 1] before decode.
         # DDIM accumulation can drift marginally outside this range even with
         # the x0_pred clamp; applying it here prevents Drake from receiving
         # physically impossible coordinates (e.g. y=-0.51m outside workspace).
-        xyz = x0[:, :, :3].clamp(-1.0, 1.0)
+        # Inverse whitening: x_norm = x_white * std + mean
+        xyz = (x0[:, :, :3] * _DATA_STD_XYZ.to(device) + _DATA_MEAN_XYZ.to(device)).clamp(-1.0, 1.0)
         rot6d_pred = x0[:, :, 3:9]
         # Normalised scale range: (physical - 1.0) / 0.5, so physical [0.5, 1.5]
         # maps to normalised [-1.0, 1.0]. Clamp in normalised space.
-        scale_pred = x0[:, :, 9:12].clamp(-1.0, 1.0)
+        scale_pred = (x0[:, :, 9:12] * _DATA_STD_SCALE.to(device) + _DATA_MEAN_SCALE.to(device)).clamp(-1.0, 1.0)
         pres_bit = x0[:, :, 12]
 
         for i in range(b):
-            pres_mask = pres_bit[i] > 0.0
+            pres_mask = pres_bit[i] > -0.589  # calibrated threshold (matches probe_drake.py)
             quats = rot6d_to_quat_wxyz(rot6d_pred[i])             # (N_MAX, 4)
             poses_raw = torch.cat([xyz[i], quats], dim=-1)        # (N_MAX, 7)
             types = torch.zeros(N_MAX, dtype=torch.long)
@@ -380,7 +425,11 @@ def main() -> None:
     dcfg_diff = cfg.get("diffusion", {})
     T = int(dcfg_diff.get("T", 1000))
     ddim_steps = int(dcfg_diff.get("ddim_steps", 50))
-    schedule = CosineSchedule(T=T)
+    prediction_type: str = dcfg_diff.get("prediction_type", "epsilon")
+    zero_terminal_snr: bool = bool(dcfg_diff.get("zero_terminal_snr", False))
+    schedule = CosineSchedule(T=T, zero_terminal_snr=zero_terminal_snr)
+    print(f"Schedule: T={T}, zero_terminal_snr={zero_terminal_snr}, prediction_type={prediction_type}")
+    print(f"  alpha_bar[0]={schedule._alpha_bar[0]:.6f}  alpha_bar[-1]={schedule._alpha_bar[-1]:.2e}")
 
     # --- Training config ---
     tcfg = cfg.get("training", {})
@@ -578,7 +627,7 @@ def main() -> None:
 
     # --- Optimizer + LR schedule ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None  # type: ignore[attr-defined]
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     def _lr_lambda(step: int) -> float:
         if step < warmup_steps:
@@ -647,6 +696,9 @@ def main() -> None:
         resume_run_id=wandb_resume_id,
     )
 
+    # --- Runtime invariant monitor ---
+    invariants = TrainingInvariants()
+
     # --- CFG dropout smoke test ---
     if cfg_dropout > 0.0 and text_cache is not None:
         print(f"CFG dropout={cfg_dropout:.2f} -- running 1000-batch smoke test...")
@@ -708,13 +760,23 @@ def main() -> None:
             t_idx = torch.randint(0, T, (B,), device=device)
 
             # Sample noise and compute noisy input.
-            eps_xyz = torch.randn_like(x_cont[:, :, :3])
-            eps_rot = torch.randn_like(x_cont[:, :, 3:9])
+            eps_xyz   = torch.randn_like(x_cont[:, :, :3])
+            eps_rot   = torch.randn_like(x_cont[:, :, 3:9])
             eps_scale = torch.randn_like(x_cont[:, :, 9:12])
-            eps_pres = torch.randn_like(x_cont[:, :, 12:13])
+            eps_pres  = torch.randn_like(x_cont[:, :, 12:13])
 
             eps_cont = torch.cat([eps_xyz, eps_rot, eps_scale, eps_pres], dim=-1)
             x_noisy, _ = schedule.add_noise(x_cont, t_idx, eps_cont)
+
+            if prediction_type == "v":
+                v_cont = schedule.compute_v_target(x_cont, eps_cont, t_idx)
+                target_xyz, target_rot = v_cont[:, :, :3], v_cont[:, :, 3:9]
+                target_scale, target_pres = v_cont[:, :, 9:12], v_cont[:, :, 12:13]
+            else:
+                target_xyz   = eps_xyz
+                target_rot   = eps_rot
+                target_scale = eps_scale
+                target_pres  = eps_pres
 
             step_t0 = time.monotonic()
             import contextlib
@@ -734,9 +796,13 @@ def main() -> None:
                 pred = model(x_noisy, type_ids_input, t_idx, text_emb_b)
                 loss_out = loss_fn(
                     pred,
-                    eps_xyz, eps_rot, eps_scale, eps_pres,
+                    target_xyz, target_rot, target_scale, target_pres,
                     type_ids, presence,
                 )
+                # --- Invariant checks ---
+                if step % 1000 == 0 and hasattr(pred, 'cont'):
+                    invariants.check_output(pred.cont.detach().cpu(), step)
+                    log_output_stats(pred.cont.detach().cpu(), step, run=wandb_run)
                 loss = loss_out.total / grad_accum
 
             if scaler is not None:

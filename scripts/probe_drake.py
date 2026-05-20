@@ -40,6 +40,20 @@ from model.schedule import CosineSchedule, DDIMSampler  # noqa: E402
 from model.text_encoder import TextEncoder  # noqa: E402
 from scene.schema import N_MAX, SceneTensor, WorkspaceBounds  # noqa: E402
 from validator.core import SceneValidator  # noqa: E402
+import torch as _torch
+_DATA_MEAN_XYZ   = _torch.tensor([-0.049867, +0.378790, -0.751155])
+_DATA_STD_XYZ    = _torch.tensor([+0.419080, +0.457588, +0.127651])
+_DATA_MEAN_SCALE = _torch.tensor([-0.038706, -0.038706, -0.038706])
+_DATA_STD_SCALE  = _torch.tensor([+0.221619, +0.221619, +0.221619])
+
+
+# Whitening constants -- must mirror train.py _DATA_MEAN_* / _DATA_STD_*
+# Model output is in whitened space. Inverse: x_norm = x_white * std + mean.
+import torch as _torch
+_DATA_MEAN_XYZ   = _torch.tensor([-0.049867, +0.378790, -0.751155])  # (3,)
+_DATA_STD_XYZ    = _torch.tensor([+0.419080, +0.457588, +0.127651])  # (3,) z_std is 3x smaller -- was the mismatch
+_DATA_MEAN_SCALE = _torch.tensor([-0.038706, -0.038706, -0.038706])  # (3,)
+_DATA_STD_SCALE  = _torch.tensor([+0.221619, +0.221619, +0.221619])  # (3,)
 
 # ── Held-out description templates (same as probe_vlm.py) ─────────────────────
 _HELD_OUT_TEMPLATES = [
@@ -154,7 +168,22 @@ def main() -> None:
              "For v7+ checkpoints trained with cfg_dropout>0, values in [0,5] give "
              "smooth monotone tradeoff between validity and text-following.",
     )
+    p.add_argument("--presence-threshold", type=float, default=0.0,
+                        help="Logit threshold for presence binarisation")
     p.add_argument("--out", default=None, help="JSON output path")
+    p.add_argument(
+        "--presence-threshold", type=float, default=-0.589,
+        help=(
+            "Logit threshold for the presence decode step. "
+            "The training dataset has 24.4%% slot occupancy (mean 2.93 objects "
+            "per 12-slot scene). The optimal logit threshold that reproduces this "
+            "occupancy at inference is log(0.244/0.756) = -1.13, but empirically "
+            "-0.589 matches the model output distribution at step 50k. "
+            "The old default of 0.0 (sigmoid > 0.5) decoded only ~12%% of slots "
+            "as present, causing false-sparse scenes and invalid Drake probes. "
+            "Set to 0.0 to recover the legacy behaviour."
+        ),
+    )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -194,8 +223,10 @@ def main() -> None:
     ddim_cfg = cfg.get("diffusion", {})
     T = int(ddim_cfg.get("T", 1000))
     ddim_steps = int(ddim_cfg.get("ddim_steps", 50))
-    schedule = CosineSchedule(T=T)
-    sampler = DDIMSampler(schedule, n_steps=ddim_steps)
+    prediction_type = ddim_cfg.get("prediction_type", "epsilon")
+    zero_terminal_snr = bool(ddim_cfg.get("zero_terminal_snr", False))
+    schedule = CosineSchedule(T=T, zero_terminal_snr=zero_terminal_snr)
+    sampler = DDIMSampler(schedule, n_steps=ddim_steps, prediction_type=prediction_type)
 
     # ── Text conditioning setup ───────────────────────────────────────────────
     prompts = _load_prompts(args.text_mode, artifacts_dir)
@@ -254,13 +285,16 @@ def main() -> None:
             rng_seed += 1
             remaining -= b
 
-            xyz = x_cont[:, :, :3].clamp(-1.0, 1.0)
+            # Inverse whitening: x_norm = x_white * std + mean, then clamp to [-1,1].
+            xyz = x_cont[:, :, :3] * _DATA_STD_XYZ.to(x_cont.device) + _DATA_MEAN_XYZ.to(x_cont.device)
+            xyz = xyz.clamp(-1.0, 1.0)
             rot6d_pred = x_cont[:, :, 3:9]
-            scale_pred = x_cont[:, :, 9:12].clamp(-1.0, 1.0)
+            scale_pred = x_cont[:, :, 9:12] * _DATA_STD_SCALE.to(x_cont.device) + _DATA_MEAN_SCALE.to(x_cont.device)
+            scale_pred = scale_pred.clamp(-1.0, 1.0)
             pres_bit = x_cont[:, :, 12]
 
             for i in range(b):
-                pres_mask = pres_bit[i] > 0.0
+                pres_mask = pres_bit[i] > args.presence_threshold
                 quats = rot6d_to_quat_wxyz(rot6d_pred[i])
                 poses_raw = torch.cat([xyz[i], quats], dim=-1)
                 st_norm = SceneTensor(
@@ -269,6 +303,9 @@ def main() -> None:
                     scales=scale_pred[i].cpu(),
                     presence=pres_mask.cpu(),
                 )
+                # Pass normalized SceneTensor to dict. The _validate_worker
+                # subprocess calls denormalize(bounds) before running Drake,
+                # so physical conversion happens exactly once in the worker.
                 scenes_as_dicts.append({
                     "object_types": st_norm.object_types,
                     "poses": st_norm.poses,

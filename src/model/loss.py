@@ -1,23 +1,25 @@
 """Loss module for the Demiurge scene diffusion model.
 
 Computes a weighted sum of per-component losses:
-  - pose_xyz:      MSE between predicted and actual noise for XYZ position
-  - pose_rot:      MSE between predicted and actual noise for 6D rotation
-  - scale:         MSE between predicted and actual noise for scale
+  - pose_xyz:      MSE between predicted and actual target for XYZ position
+  - pose_rot:      MSE between predicted and actual target for 6D rotation
+  - scale:         MSE between predicted and actual target for scale
   - type_ce:       Cross-entropy on predicted type logits
   - presence_bce:  Binary cross-entropy on presence logit
 
-Continuous losses (pose_xyz, pose_rot, scale) and type_ce are masked to
-present slots only. presence_bce is applied to ALL slots because the model
-must learn to predict which slots are occupied.
+Target is eps (noise) for prediction_type='epsilon', or v-velocity for
+prediction_type='v'. Both are dimensionless unit-scale quantities when
+training data is whitened.
 
-All per-component losses are returned individually for W&B logging.
+Continuous losses are masked to present slots only. presence_bce is
+applied to ALL slots.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
+from model.presence_loss import presence_bce_balanced, PRESENCE_POS_WEIGHT
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -118,10 +120,10 @@ class SceneDiffusionLoss(torch.nn.Module):
     def forward(
         self,
         pred: DenoiserOutput,
-        eps_xyz: Tensor,
-        eps_rot6d: Tensor,
-        eps_scale: Tensor,
-        eps_presence: Tensor,
+        target_xyz: Tensor,
+        target_rot6d: Tensor,
+        target_scale: Tensor,
+        target_presence: Tensor,
         target_type_ids: Tensor,
         presence_mask: Tensor,
     ) -> LossOutput:
@@ -129,34 +131,29 @@ class SceneDiffusionLoss(torch.nn.Module):
 
         Args:
             pred: Raw model output from SceneDenoiser.forward().
-            eps_xyz: Ground-truth noise for XYZ. Shape: (B, N_MAX, 3).
-            eps_rot6d: Ground-truth noise for 6D rotation. Shape: (B, N_MAX, 6).
-            eps_scale: Ground-truth noise for scale. Shape: (B, N_MAX, 3).
-            eps_presence: Ground-truth noise for presence bit. Shape: (B, N_MAX, 1).
+            target_xyz: Regression target for XYZ (eps or v). Shape: (B, N_MAX, 3).
+            target_rot6d: Regression target for 6D rotation. Shape: (B, N_MAX, 6).
+            target_scale: Regression target for scale. Shape: (B, N_MAX, 3).
+            target_presence: Regression target for presence. Shape: (B, N_MAX, 1).
             target_type_ids: True object type IDs (from clean scene).
                 Shape: (B, N_MAX), dtype=long.
             presence_mask: Boolean mask of occupied slots in the CLEAN scene.
                 Shape: (B, N_MAX). True = slot is occupied.
-                Used to mask continuous and type losses. Presence BCE uses
-                all slots.
-
-        Returns:
-            LossOutput with total and individual component losses.
         """
         w = self.weights
-        mask = presence_mask.float()           # (B, N_MAX) -- 1 for present slots
-        n_present = mask.sum().clamp(min=1.0)  # avoid division by zero
+        mask = presence_mask.float()           # (B, N_MAX)
+        n_present = mask.sum().clamp(min=1.0)
 
         # --- XYZ MSE (present slots only) ---
-        xyz_err = ((pred.xyz - eps_xyz) ** 2).sum(dim=-1)        # (B, N_MAX)
+        xyz_err = ((pred.xyz - target_xyz) ** 2).sum(dim=-1)        # (B, N_MAX)
         loss_xyz = (xyz_err * mask).sum() / n_present
 
         # --- Rotation 6D MSE (present slots only) ---
-        rot_err = ((pred.rot6d - eps_rot6d) ** 2).sum(dim=-1)    # (B, N_MAX)
+        rot_err = ((pred.rot6d - target_rot6d) ** 2).sum(dim=-1)    # (B, N_MAX)
         loss_rot = (rot_err * mask).sum() / n_present
 
         # --- Scale MSE (present slots only) ---
-        scale_err = ((pred.scale - eps_scale) ** 2).sum(dim=-1)  # (B, N_MAX)
+        scale_err = ((pred.scale - target_scale) ** 2).sum(dim=-1)  # (B, N_MAX)
         loss_scale = (scale_err * mask).sum() / n_present
 
         # --- Type cross-entropy (present slots only) ---
@@ -175,8 +172,13 @@ class SceneDiffusionLoss(torch.nn.Module):
         # pred.presence_logit: (B, N_MAX, 1); eps_presence used as target proxy
         # here we use the CLEAN presence mask as the target (not the noisy bit).
         pres_target = presence_mask.float().unsqueeze(-1)                   # (B, N_MAX, 1)
-        loss_pres = F.binary_cross_entropy_with_logits(
-            pred.presence_logit, pres_target, reduction="mean"
+        # Use class-balanced BCE (pos_weight=3.10) to prevent presence collapse.
+        # Plain BCE with occupancy=0.244 biases the model toward predicting all-absent,
+        # which caused v5's presence collapse (27.6% -> 16.1% active over 30k steps).
+        loss_pres = presence_bce_balanced(
+            pred.presence_logit.squeeze(-1),  # (B, N_MAX)
+            pres_target.squeeze(-1),          # (B, N_MAX)
+            pos_weight=PRESENCE_POS_WEIGHT,
         )
 
         total = (

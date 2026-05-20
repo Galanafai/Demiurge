@@ -1,0 +1,69 @@
+# v9 unconditional v4 -- zero-centered normalization fix
+#
+# Root cause of v1-v3 failure: training data in normalized space has
+# non-zero means that conflict with the DDPM Gaussian prior N(0, I):
+#   y_norm: +0.381  (sampler places objects in +y half of workspace)
+#   z_norm: -0.753  (z >= 0 physically, so normalized mean cannot be 0)
+#   scale_norm: -0.041  (minor)
+#
+# Fix applied in scripts/train.py _scene_to_cont():
+#   Subtract DATA_NORM_MEAN after range-normalize so the model sees
+#   zero-mean targets. probe_drake.py adds the mean back at decode time.
+#
+# All other architecture and loss weights identical to v3.
+
+model:
+  n_layers: 16
+  d_model: 384
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  use_type_grad_isolation: false
+  use_slot_id_embed: true
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+
+training:
+  max_steps: 100000
+  batch_size: 64
+  lr: 3.0e-4
+  warmup_steps: 2000
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  gradient_accumulation: 1
+  checkpoint_steps: 10000
+  val_every_epochs: 1
+  val_n_scenes: 100
+  weighted_sampling: false
+  dtype: float32
+  log_every_steps: 100
+  cfg_dropout: 0.0
+  warm_init_from: null
+  use_discrete_type_diffusion: true
+
+loss:
+  pose_xyz: 2.0
+  pose_rot: 1.0
+  scale: 0.5
+  type_ce: 1.0
+  presence_bce: 0.3
+
+dataset:
+  path: data/combined
+  hash: ""
+  num_workers: 32
+  persistent_workers: true
+  prefetch_factor: 4
+
+text_conditioning: false
+
+wandb:
+  enabled: true
+  project: demiurge
+  experiment: v9_uncond_v4_zerocentered
+  tags: [v9, uncond, scratch, 49M, 234k, zero-centered, prior-fix]
+
+output:
+  dir: checkpoints/v9_uncond_v4
