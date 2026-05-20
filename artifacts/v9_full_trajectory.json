@@ -1,0 +1,57 @@
+{
+  "model_id": "v9_final_step170k",
+  "training_runs": [
+    {"name": "v1", "steps": 150000, "result": "0% Drake", "cause": "type_grad_isolation memorization shortcut"},
+    {"name": "v2", "steps": 100000, "result": "0% Drake", "cause": "warm-init from poisoned v1"},
+    {"name": "v3", "steps": 150000, "result": "0% Drake", "cause": "z-collapse covariance mismatch"},
+    {"name": "v4", "steps": 100000, "result": "4% peak step 20k then collapsed", "cause": "output drift"},
+    {"name": "v5", "steps": 0, "result": "killed, std=5.32 explosion", "cause": "DDIM sampler hardwired epsilon decode"},
+    {"name": "v6", "steps": 134000, "result": "0% final", "cause": "Drake API bug + presence collapse"},
+    {"name": "v7", "steps": 140000, "result": "1.1% overall baseline", "cause": "x-spread deficit, yaw not enforced"},
+    {"name": "v9 (v7+pose_rot=2.0)", "steps": 260000, "peak_step": 170000, "result": "3.0% overall, 11.3% non-empty"}
+  ],
+  "probe_trajectory": [
+    {"step": 160000, "n_valid": 40, "empty": 60, "x_std": 0.6223, "accepted": 1, "stable": 7,  "ik": 30, "rrt": 9},
+    {"step": 170000, "n_valid": 31, "empty": 69, "x_std": 0.6451, "accepted": 4, "stable": 10, "ik": 25, "rrt": 10},
+    {"step": 180000, "n_valid": 11, "empty": 89, "x_std": 0.6714, "accepted": 1, "stable": 5,  "ik": 9,  "rrt": 3},
+    {"step": 200000, "n_valid": 7,  "empty": 93, "x_std": 0.4067, "accepted": 0, "stable": 5,  "ik": 7,  "rrt": 0},
+    {"step": 220000, "n_valid": 9,  "empty": 91, "x_std": 0.3264, "accepted": 1, "stable": 9,  "ik": 9,  "rrt": 1},
+    {"step": 260000, "n_valid": 2,  "empty": 98, "x_std": 0.7344, "accepted": 0, "stable": 2,  "ik": 0,  "rrt": 0}
+  ],
+  "step170k_full_probe": {
+    "n_scenes": 200, "seed": 0, "yaw_projection": true,
+    "non_empty": 53, "empty": 147,
+    "accepted_overall": 6, "accepted_overall_rate": 0.030,
+    "accepted_nonempty": 6, "accepted_nonempty_rate": 0.113,
+    "interp_pass_rate": 1.000, "stable_pass_rate": 0.302,
+    "ik_pass_rate": 0.811, "rrt_pass_rate": 0.245,
+    "x_spread_whitened": 0.637
+  },
+  "vs_v7_baseline": {
+    "accepted_overall":  {"v7": 0.011, "v9": 0.030, "uplift": "3x"},
+    "accepted_nonempty": {"v7": 0.011, "v9": 0.113, "uplift": "10x"},
+    "stable_pass":       {"v7": 0.050, "v9": 0.302, "uplift": "6x"},
+    "ik_pass":           {"v7": 0.728, "v9": 0.811, "uplift": "+8pp"}
+  },
+  "bugs_found": [
+    "type_grad_isolation memorization shortcut",
+    "Presence threshold inconsistency in probe script",
+    "Probe double-denormalization",
+    "Inline validator denormalization mismatch",
+    "Whitening constants mismatch train vs probe",
+    "DDIM sampler hardwired epsilon decode in v-prediction mode",
+    "Drake API SetDefaultFloatingBaseBodyPose renamed to SetDefaultFreeBodyPose",
+    "Presence collapse from insufficient BCE pos_weight",
+    "X-coordinate spread deficit",
+    "Yaw-only constraint unenforced at inference",
+    "Loss channel imbalance: rot6d 6ch vs xyz 3ch",
+    "LR scheduler fast-forward misaligns Adam momentum on warm resume"
+  ],
+  "unit_tests": 38,
+  "total_cost_usd": 40,
+  "refs": [
+    "Lin et al. 2024 - Common Diffusion Noise Schedules and Sample Steps are Flawed",
+    "Everaert et al. 2024 - Covariance Mismatch in Diffusion Models",
+    "Salimans & Ho 2022 - Progressive Distillation (v-parameterization)"
+  ]
+}
