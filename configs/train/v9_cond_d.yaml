@@ -1,0 +1,54 @@
+# Phase D - v9 Conditional Training
+# Warm-init from v9 step 170k + text conditioning via CFG dropout
+# All v9 audit findings preserved
+
+model:
+  d_model: 384
+  n_layers: 16
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.0
+  use_type_grad_isolation: false
+  use_slot_id_embed: true
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+  prediction_type: v
+  zero_terminal_snr: true
+
+training:
+  max_steps: 200000
+  batch_size: 64
+  lr: 1e-4
+  warmup_steps: 5000
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  checkpoint_steps: 10000
+  val_every_epochs: 4
+  val_n_scenes: 100
+  warm_init_from: checkpoints/v9_uncond_v9/step_00170000.pt
+  cfg_dropout: 0.10
+  use_discrete_type_diffusion: true
+  weighted_sampling: false
+  log_every_steps: 100
+  dtype: float32
+
+normalization:
+  method: whitening
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 2.0
+  scale: 1.0
+  type_ce: 1.0
+  presence_bce: 1.5
+
+data:
+  source: data/v1/
+  held_out_per_template: 100
+
+logging:
+  project: demiurge
+  entity: galanafai-self
+  run_name: v9_phase_d_cond
