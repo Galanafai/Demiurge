@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v7_probe_all.sh -- sequential watcher for all v7 Drake probe checkpoints.
+# v7_probe_all.sh — sequential watcher for all v7 Drake probe checkpoints.
 # Each milestone waits until its checkpoint file appears, then runs probe_drake.py.
 # Milestones are processed in order; no two probes run concurrently (GPU safe).
 # Usage: nohup bash scripts/v7_probe_all.sh > logs/v7_probe_all.log 2>&1 &

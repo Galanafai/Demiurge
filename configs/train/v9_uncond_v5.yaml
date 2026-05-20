@@ -1,22 +1,9 @@
-# v9 v5 -- final attempt: unit-variance whitening + v-prediction + zero terminal SNR
-#
-# Diagnosis: two independent failures killed v4:
-#   1. Covariance mismatch: z_std ~0.10 vs x_std ~0.41 means isotropic N(0,I) noise
-#      overwhelms the z signal by ~4x. Full whitening fixes this.
-#   2. Signal leak bias: cosine schedule gives alpha_bar(T) ~= 1.6e-5 != 0, so
-#      x_T still contains signal. Zero terminal SNR + v-prediction fix this.
-#
-# References:
-#   Lin et al. 2024 "Common Diffusion Noise Schedules and Sample Steps are Flawed"
-#   Salimans and Ho 2022 "Progressive Distillation for Fast Sampling"
-
 model:
   d_model: 384
   n_layers: 16
   n_heads: 8
   ffn_mult: 4
   dropout: 0.0
-  use_cross_attention: false
   use_type_grad_isolation: false
   use_slot_id_embed: true
   use_discrete_type_diffusion: true
@@ -24,8 +11,8 @@ model:
 diffusion:
   T: 1000
   ddim_steps: 50
-  prediction_type: v              # velocity parameterization
-  zero_terminal_snr: true         # enforce alpha_bar(T) = 0 exactly
+  prediction_type: v
+  zero_terminal_snr: true
 
 training:
   max_steps: 100000
@@ -34,7 +21,7 @@ training:
   warmup_steps: 2000
   ema_decay: 0.9999
   checkpoint_steps: 10000
-  val_every_epochs: 999           # disable epoch-level val; use inline Drake probe
+  val_every_epochs: 999
   val_n_scenes: 0
   grad_clip: 1.0
   gradient_accumulation: 1
@@ -44,7 +31,7 @@ training:
   cfg_dropout: 0.0
 
 loss:
-  pose_xyz: 1.0       # whitening equalises scale -- uniform weights
+  pose_xyz: 1.0
   pose_rot: 1.0
   scale: 1.0
   type_ce: 1.0
@@ -55,6 +42,7 @@ output:
   dir: checkpoints/v9_uncond_v5
 
 wandb:
+  enabled: true
   project: demiurge
   entity: galanafai-self
   run_name: v9_uncond_v5_whiten_vpred_zerosnr

@@ -40,6 +40,12 @@ from model.schedule import CosineSchedule, DDIMSampler  # noqa: E402
 from model.text_encoder import TextEncoder  # noqa: E402
 from scene.schema import N_MAX, SceneTensor, WorkspaceBounds  # noqa: E402
 from validator.core import SceneValidator  # noqa: E402
+import torch as _torch
+_DATA_MEAN_XYZ   = _torch.tensor([-0.049867, +0.378790, -0.751155])
+_DATA_STD_XYZ    = _torch.tensor([+0.419080, +0.457588, +0.127651])
+_DATA_MEAN_SCALE = _torch.tensor([-0.038706, -0.038706, -0.038706])
+_DATA_STD_SCALE  = _torch.tensor([+0.221619, +0.221619, +0.221619])
+
 
 # Whitening constants -- must mirror train.py _DATA_MEAN_* / _DATA_STD_*
 # Model output is in whitened space. Inverse: x_norm = x_white * std + mean.
@@ -162,6 +168,8 @@ def main() -> None:
              "For v7+ checkpoints trained with cfg_dropout>0, values in [0,5] give "
              "smooth monotone tradeoff between validity and text-following.",
     )
+    p.add_argument("--presence-threshold", type=float, default=0.0,
+                        help="Logit threshold for presence binarisation")
     p.add_argument("--out", default=None, help="JSON output path")
     p.add_argument(
         "--presence-threshold", type=float, default=-0.589,
@@ -215,8 +223,10 @@ def main() -> None:
     ddim_cfg = cfg.get("diffusion", {})
     T = int(ddim_cfg.get("T", 1000))
     ddim_steps = int(ddim_cfg.get("ddim_steps", 50))
-    schedule = CosineSchedule(T=T)
-    sampler = DDIMSampler(schedule, n_steps=ddim_steps)
+    prediction_type = ddim_cfg.get("prediction_type", "epsilon")
+    zero_terminal_snr = bool(ddim_cfg.get("zero_terminal_snr", False))
+    schedule = CosineSchedule(T=T, zero_terminal_snr=zero_terminal_snr)
+    sampler = DDIMSampler(schedule, n_steps=ddim_steps, prediction_type=prediction_type)
 
     # ── Text conditioning setup ───────────────────────────────────────────────
     prompts = _load_prompts(args.text_mode, artifacts_dir)
@@ -284,7 +294,7 @@ def main() -> None:
             pres_bit = x_cont[:, :, 12]
 
             for i in range(b):
-                pres_mask = pres_bit[i] > args.presence_threshold  # calibrated threshold
+                pres_mask = pres_bit[i] > args.presence_threshold
                 quats = rot6d_to_quat_wxyz(rot6d_pred[i])
                 poses_raw = torch.cat([xyz[i], quats], dim=-1)
                 st_norm = SceneTensor(

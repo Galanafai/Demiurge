@@ -11,7 +11,7 @@
     {"name": "v9 (v7+pose_rot=2.0)", "steps": 260000, "peak_step": 170000, "result": "3.0% overall, 11.3% non-empty"}
   ],
   "probe_trajectory": [
-    {"step": 160000, "n_valid": 40, "empty": 60, "x_std": 0.6223, "accepted": 1, "stable": 7,  "ik": 30, "rrt": 9},
+    {"step": 160000, "n_valid": 40, "empty": 60, "x_std": 0.6223, "accepted": 1, "stable": 7, "ik": 30, "rrt": 9},
     {"step": 170000, "n_valid": 31, "empty": 69, "x_std": 0.6451, "accepted": 4, "stable": 10, "ik": 25, "rrt": 10},
     {"step": 180000, "n_valid": 11, "empty": 89, "x_std": 0.6714, "accepted": 1, "stable": 5,  "ik": 9,  "rrt": 3},
     {"step": 200000, "n_valid": 7,  "empty": 93, "x_std": 0.4067, "accepted": 0, "stable": 5,  "ik": 7,  "rrt": 0},

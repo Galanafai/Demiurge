@@ -75,6 +75,19 @@ class CosineSchedule:
             betas = 1.0 - alpha_bar_full[1:] / alpha_bar_full[:-1]
             betas = betas.clamp(0.0, clip_beta_max)
 
+        if zero_terminal_snr:
+            # Lin et al. 2024: rescale sqrt(alpha_bar) so terminal = 0 exactly.
+            sqrt_ab = alpha_bar.sqrt()
+            sqrt_ab_0 = sqrt_ab[0].clone()
+            sqrt_ab_T = sqrt_ab[-1].clone()
+            sqrt_ab = sqrt_ab - sqrt_ab_T
+            sqrt_ab = sqrt_ab * sqrt_ab_0 / (sqrt_ab_0 - sqrt_ab_T)
+            alpha_bar = sqrt_ab ** 2
+            alpha_bar_full = torch.cat([torch.ones(1, dtype=torch.float64), alpha_bar])
+            betas = 1.0 - alpha_bar_full[1:] / alpha_bar_full[:-1]
+            betas = betas.clamp(0.0, clip_beta_max)
+
+        # Prepend 1.0 so that alpha_bar_prev[0] = 1.0 (no noise at t=-1).
         alpha_bar_prev = torch.cat([torch.ones(1, dtype=torch.float64), alpha_bar[:-1]])
 
         self._alpha_bar: Tensor = alpha_bar.float()
@@ -188,6 +201,30 @@ class CosineSchedule:
         sqrt_1mab = self.sqrt_one_minus_alpha_bar(t).view(view_shape).to(x0.device)
         return sqrt_ab * eps - sqrt_1mab * x0
 
+    def predict_x0_from_v(self, x_t, t, v_pred):
+        """x0 = sqrt(ab)*x_t - sqrt(1-ab)*v"""
+        ed = x_t.dim() - 1
+        vs = (-1,) + (1,) * ed
+        sa = self.sqrt_alpha_bar(t).view(vs).to(x_t.device)
+        s1 = self.sqrt_one_minus_alpha_bar(t).view(vs).to(x_t.device)
+        return sa * x_t - s1 * v_pred
+
+    def predict_eps_from_v(self, x_t, t, v_pred):
+        """eps = sqrt(1-ab)*x_t + sqrt(ab)*v"""
+        ed = x_t.dim() - 1
+        vs = (-1,) + (1,) * ed
+        sa = self.sqrt_alpha_bar(t).view(vs).to(x_t.device)
+        s1 = self.sqrt_one_minus_alpha_bar(t).view(vs).to(x_t.device)
+        return s1 * x_t + sa * v_pred
+
+    def compute_v_target(self, x0, eps, t):
+        """v = sqrt(ab)*eps - sqrt(1-ab)*x0"""
+        ed = x0.dim() - 1
+        vs = (-1,) + (1,) * ed
+        sa = self.sqrt_alpha_bar(t).view(vs).to(x0.device)
+        s1 = self.sqrt_one_minus_alpha_bar(t).view(vs).to(x0.device)
+        return sa * eps - s1 * x0
+
     def type_corruption_prob(self, t_idx: Tensor) -> Tensor:
         """Corruption probability for discrete type diffusion.
 
@@ -296,11 +333,8 @@ class DDIMSampler:
         eta: float = 0.0,
         prediction_type: str = "epsilon",
     ) -> None:
-        """Args:
-            prediction_type: 'epsilon' (predict noise) or 'v' (predict velocity).
-        """
         if prediction_type not in ("epsilon", "v"):
-            raise ValueError(f"prediction_type must be 'epsilon' or 'v', got {prediction_type!r}")
+            raise ValueError(f"prediction_type must be epsilon or v, got {prediction_type!r}")
         self.schedule = schedule
         self.n_steps = n_steps
         self.eta = eta
@@ -376,13 +410,17 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
-            # Decode model output to x0 and eps depending on parameterization.
+            # Predicted x_0 and eps.
+            # Branch on prediction_type so v-prediction models are handled
+            # correctly. Using epsilon formula on a v-prediction model causes
+            # output explosion (v5 failure: std=5.32, 0% Drake validity).
             if self.prediction_type == "v":
-                x0_pred = sched.predict_x0_from_v(x_t, t_tensor, eps_pred)
-                eps_for_dir = sched.predict_eps_from_v(x_t, t_tensor, eps_pred)
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
             else:
+                # Epsilon prediction (original formula).
+                # Clamp to prevent explosion when ab_t is near zero.
                 x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
-                eps_for_dir = eps_pred
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (
@@ -501,12 +539,13 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
+            # Branch on prediction_type: v-prediction or epsilon.
+            # Using epsilon formula on v-prediction model causes output explosion.
             if self.prediction_type == "v":
-                x0_pred = sched.predict_x0_from_v(x_t, t_tensor, eps_pred)
-                eps_for_dir = sched.predict_eps_from_v(x_t, t_tensor, eps_pred)
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
             else:
                 x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
-                eps_for_dir = eps_pred
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (
@@ -666,7 +705,11 @@ class DDIMSampler:
             ab_t_v = ab_t_v.view(view)
             ab_prev_v = ab_prev.view(view)
 
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            if self.prediction_type == "v":
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (
@@ -744,7 +787,11 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            if self.prediction_type == "v":
+                x0_pred = self.schedule.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_pred = self.schedule.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (
