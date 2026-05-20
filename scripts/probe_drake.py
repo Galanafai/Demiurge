@@ -168,8 +168,6 @@ def main() -> None:
              "For v7+ checkpoints trained with cfg_dropout>0, values in [0,5] give "
              "smooth monotone tradeoff between validity and text-following.",
     )
-    p.add_argument("--presence-threshold", type=float, default=0.0,
-                        help="Logit threshold for presence binarisation")
     p.add_argument("--out", default=None, help="JSON output path")
     p.add_argument(
         "--presence-threshold", type=float, default=-0.589,
