@@ -160,6 +160,8 @@ def main() -> None:
              "For v7+ checkpoints trained with cfg_dropout>0, values in [0,5] give "
              "smooth monotone tradeoff between validity and text-following.",
     )
+    p.add_argument("--presence-threshold", type=float, default=0.0,
+                        help="Logit threshold for presence binarisation")
     p.add_argument("--out", default=None, help="JSON output path")
     args = p.parse_args()
 
@@ -200,8 +202,10 @@ def main() -> None:
     ddim_cfg = cfg.get("diffusion", {})
     T = int(ddim_cfg.get("T", 1000))
     ddim_steps = int(ddim_cfg.get("ddim_steps", 50))
-    schedule = CosineSchedule(T=T)
-    sampler = DDIMSampler(schedule, n_steps=ddim_steps)
+    prediction_type = ddim_cfg.get("prediction_type", "epsilon")
+    zero_terminal_snr = bool(ddim_cfg.get("zero_terminal_snr", False))
+    schedule = CosineSchedule(T=T, zero_terminal_snr=zero_terminal_snr)
+    sampler = DDIMSampler(schedule, n_steps=ddim_steps, prediction_type=prediction_type)
 
     # ── Text conditioning setup ───────────────────────────────────────────────
     prompts = _load_prompts(args.text_mode, artifacts_dir)
@@ -266,7 +270,7 @@ def main() -> None:
             pres_bit = x_cont[:, :, 12]
 
             for i in range(b):
-                pres_mask = pres_bit[i] > 0.0
+                pres_mask = pres_bit[i] > args.presence_threshold
                 quats = rot6d_to_quat_wxyz(rot6d_pred[i])
                 poses_raw = torch.cat([xyz[i], quats], dim=-1)
                 st_norm = SceneTensor(

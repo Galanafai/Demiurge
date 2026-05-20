@@ -1,0 +1,66 @@
+# v9: True resume of v7 at step 140k.
+#
+# v8 failed because warm_init_from reset the step counter and optimizer state,
+# causing presence to re-collapse from scratch.
+#
+# Fix: seed checkpoints/v9_uncond_v9/latest.pt from v7's latest.pt.
+# train.py's resume path (line 635) detects latest.pt and restores
+# model + optimizer + step + EMA -- no step counter reset, no warmup re-run.
+#
+# Changes vs v7:
+#   - pose_rot: 1.0 -> 2.0  (rot6d per-channel gradient equalization)
+#   - max_steps: 200000 -> 260000  (60k more steps from step 140k)
+#   - run_name: v9_resume_rot2
+#   - output dir: v9_uncond_v9
+
+model:
+  d_model: 384
+  n_layers: 16
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.0
+  use_type_grad_isolation: false
+  use_slot_id_embed: true
+  use_discrete_type_diffusion: true
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+  prediction_type: v
+  zero_terminal_snr: true
+
+training:
+  max_steps: 260000
+  batch_size: 64
+  lr: 3e-4
+  warmup_steps: 2000
+  ema_decay: 0.9999
+  checkpoint_steps: 10000
+  val_every_epochs: 999
+  val_n_scenes: 0
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  use_discrete_type_diffusion: true
+  weighted_sampling: false
+  log_every_steps: 100
+  cfg_dropout: 0.0
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 2.0
+  scale: 1.0
+  type_ce: 1.0
+  presence_bce: 1.5
+  slot_diversity: 0.0
+
+output:
+  dir: checkpoints/v9_uncond_v9
+
+dataset:
+  path: data/v1
+
+wandb:
+  enabled: true
+  project: demiurge
+  entity: galanafai-self
+  run_name: v9_resume_rot2

@@ -1,0 +1,22 @@
+{
+  "step": 20000,
+  "head": "EMA",
+  "checkpoint": "checkpoints/v9_uncond_v10/step_00020000.pt",
+  "text_mode": "none",
+  "n_scenes": 100,
+  "accepted": 0,
+  "validity_rate": 0.0,
+  "rejection_reasons": {
+    "interpenetration": 4,
+    "ik_unreachable": 63,
+    "rrt_failed": 27,
+    "unstable": 6
+  },
+  "sample_elapsed_s": 5.233803676441312,
+  "drake_elapsed_s": 8.260755656287074,
+  "total_elapsed_s": 13.494567781686783,
+  "seed": 42,
+  "type_init": "uniform",
+  "drake_workers": 6,
+  "sampler": "sample_with_types"
+}

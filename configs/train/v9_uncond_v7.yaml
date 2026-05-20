@@ -1,0 +1,65 @@
+# v6: Defensive relaunch after v5 collapse (std=5.32, 0% Drake validity).
+#
+# Root causes fixed vs v5:
+#   1. DDIM sampler hardwired epsilon formula even with prediction_type=v.
+#      Fixed: DDIMSampler.sample() and sample_with_types() now branch on
+#      self.prediction_type and call schedule.predict_x0_from_v.
+#   2. Presence BCE lacked pos_weight; model collapsed to all-absent.
+#      Fixed: loss.py uses presence_bce_balanced (pos_weight=3.10).
+#   3. No runtime sanity check; explosion went undetected for 60k steps.
+#      Fixed: run_validation() calls check_output_sanity each val batch.
+#
+# Architecture identical to v5 (49M params, d_model=384, n_layers=16).
+# All 38 pre-flight tests pass before this config is used.
+
+model:
+  d_model: 384
+  n_layers: 16
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.0
+  use_type_grad_isolation: false
+  use_slot_id_embed: true
+  use_discrete_type_diffusion: true
+
+diffusion:
+  T: 1000
+  ddim_steps: 50
+  prediction_type: v
+  zero_terminal_snr: true
+
+training:
+  max_steps: 200000
+  batch_size: 64
+  lr: 3e-4
+  warmup_steps: 2000
+  ema_decay: 0.9999
+  checkpoint_steps: 10000
+  val_every_epochs: 999
+  val_n_scenes: 0
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  use_discrete_type_diffusion: true
+  weighted_sampling: false
+  log_every_steps: 100
+  cfg_dropout: 0.0
+
+loss:
+  pose_xyz: 1.0
+  pose_rot: 1.0
+  scale: 1.0
+  type_ce: 1.0
+  # Increased from v5's 0.3: balanced BCE (pos_weight=3.10) means this weight
+  # now affects the loss differently. Keep at 0.3 -- effective gradient weight
+  # is already 3.1x larger per positive slot.
+  presence_bce: 1.5
+  slot_diversity: 0.0
+
+output:
+  dir: checkpoints/v9_uncond_v7
+
+wandb:
+  enabled: true
+  project: demiurge
+  entity: galanafai-self
+  run_name: v7_presence_fix

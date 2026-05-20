@@ -1,0 +1,62 @@
+{
+  "model_id": "v9_step170k",
+  "ckpt_path": "checkpoints/v9_uncond_v9/step_00170000.pt",
+  "probe_n": 200,
+  "probe_seed": 0,
+  "yaw_projection": "rot6d[:,2]=0; rot6d[:,5]=0",
+  "presence_threshold": -0.589,
+  "scenes_with_objects": 53,
+  "empty_scenes": 147,
+  "on_nonempty": {
+    "n": 53,
+    "accepted": {
+      "count": 6,
+      "rate": 0.113
+    },
+    "interp": {
+      "count": 53,
+      "rate": 1.0
+    },
+    "stable": {
+      "count": 16,
+      "rate": 0.302
+    },
+    "ik": {
+      "count": 43,
+      "rate": 0.811
+    },
+    "rrt": {
+      "count": 13,
+      "rate": 0.245
+    }
+  },
+  "overall": {
+    "accepted": 6,
+    "rate": 0.03
+  },
+  "x_spread_whitened": 0.637,
+  "vs_v7_baseline": {
+    "v7_accepted_overall": 0.011,
+    "v9_accepted_overall": 0.03,
+    "uplift_overall": "3x",
+    "v7_accepted_nonempty": 0.011,
+    "v9_accepted_nonempty": 0.113,
+    "uplift_nonempty": "10x",
+    "v7_stable": 0.05,
+    "v9_stable": 0.302,
+    "uplift_stable": "6x",
+    "v7_ik": 0.728,
+    "v9_ik": 0.811
+  },
+  "known_issues": [
+    "Presence collapsed during LR scheduler fast-forward at resume: 73% empty scenes",
+    "Peak validity occurs at step 170k before collapse deepens",
+    "With healthy presence (v7 level), projected validity: ~8-10% overall"
+  ],
+  "inference_recipe": [
+    "sampler = DDIMSampler(CosineSchedule(T=1000, zero_terminal_snr=True), n_steps=50, prediction_type='v')",
+    "x0 = sampler.sample(model.noise_prediction_fn(None), (N, N_MAX, 13), seed=seed)",
+    "x0[:,:,3+2] = 0; x0[:,:,3+5] = 0  # yaw-only projection",
+    "validate via SceneValidator.validate()"
+  ]
+}

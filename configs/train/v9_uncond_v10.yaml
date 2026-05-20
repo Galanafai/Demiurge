@@ -1,0 +1,46 @@
+# v10: fresh training, all audit fixes from step 0, no resume
+dataset:
+  path: data/v1
+diffusion:
+  T: 1000
+  ddim_steps: 50
+  prediction_type: v
+  zero_terminal_snr: true
+loss:
+  pose_rot: 2.0
+  pose_xyz: 1.0
+  presence_bce: 1.5
+  scale: 1.0
+  slot_diversity: 0.0
+  type_ce: 1.0
+model:
+  d_model: 384
+  dropout: 0.0
+  ffn_mult: 4
+  n_heads: 8
+  n_layers: 16
+  use_discrete_type_diffusion: true
+  use_slot_id_embed: true
+  use_type_grad_isolation: false
+output:
+  dir: checkpoints/v9_uncond_v10
+training:
+  batch_size: 64
+  cfg_dropout: 0.0
+  checkpoint_steps: 10000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  gradient_accumulation: 1
+  log_every_steps: 100
+  lr: 0.0003
+  max_steps: 150000
+  use_discrete_type_diffusion: true
+  val_every_epochs: 999
+  val_n_scenes: 0
+  warm_init_from: null
+  warmup_steps: 2000
+  weighted_sampling: false
+wandb:
+  enabled: true
+  project: demiurge
+  run_name: v10_fresh_all_fixes

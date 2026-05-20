@@ -130,7 +130,7 @@ def _init_wandb(
     else:
         run = wandb.init(
             project=wcfg.get("project", "demiurge"),
-            name=wcfg.get("experiment", "unnamed"),
+            name=wcfg.get("run_name", wcfg.get("experiment", "unnamed")),
             tags=wcfg.get("tags", []),
             config={**run_cfg, "git_sha": git_sha},
         )

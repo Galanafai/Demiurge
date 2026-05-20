@@ -17,7 +17,7 @@ import torch.nn.functional as F
 # Computed from training data: 234,720 scenes, ~2.93 objects/scene, 12 slots.
 # occupancy = 2.93 / 12 = 0.244
 # pos_weight = (1 - 0.244) / 0.244 = 3.10
-PRESENCE_POS_WEIGHT: float = 3.10
+PRESENCE_POS_WEIGHT: float = 5.0
 
 
 def compute_presence_pos_weight(occupancy: float) -> float:

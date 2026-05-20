@@ -42,6 +42,7 @@ output:
   dir: checkpoints/v9_uncond_v5
 
 wandb:
+  enabled: true
   project: demiurge
   entity: galanafai-self
   run_name: v9_uncond_v5_whiten_vpred_zerosnr
