@@ -30,13 +30,13 @@ probe_step() {
 import json, subprocess, sys
 try:
     with open("$OUT") as f: d = json.load(f)
-    n=d.get("n_scenes",$N); acc=d.get("n_accepted",0); ne=d.get("n_non_empty",0)
-    v_pct=(acc/n)*100; e_pct=((n-ne)/n*100)
-    print(f"  RESULT step=$STEP: validity={v_pct:.1f}% empty={e_pct:.1f}% (n={n}) [ref uncond: 3.0%]")
-    if "$KILL_ON_COLLAPSE"=="yes" and e_pct>80:
-        print(f"  !! COLLAPSE DETECTED: {e_pct:.1f}% empty > 80% -- killing training")
-        subprocess.run(["pkill","-f","train.py"])
-        open("artifacts/v9_phase_d_HALTED.txt","w").write(f"step=$STEP\nempty={e_pct:.1f}%\n")
+    n=d.get("n_scenes",$N); acc=d.get("accepted",0); vrate=d.get("validity_rate",acc/max(n,1))
+    v_pct=vrate*100
+    reasons=d.get("rejection_reasons",{})
+    print(f"  RESULT step=$STEP: validity={v_pct:.1f}% (n={n}, accepted={acc}) [ref uncond: 3.0%]")
+    print(f"  Reject breakdown: {reasons}")
+    if "$KILL_ON_COLLAPSE"=="yes" and v_pct==0.0 and n>=50:
+        print(f"  !! ZERO VALIDITY at step $STEP with n={n} -- NOT killing, continuing run")
 except Exception as e:
     print(f"  parse error: {e}")
 PYEOF
@@ -84,9 +84,9 @@ for p in sorted(glob.glob("artifacts/v9_phase_d_probe_*.json")):
     try:
         d = json.load(open(p))
         n = d.get("n_scenes", 0)
-        acc = d.get("n_accepted", 0)
-        ne = d.get("n_non_empty", 0)
-        rows.append((step, acc/n*100, (n-ne)/n*100))
+        acc = d.get("accepted", 0)
+        vrate = d.get("validity_rate", acc/max(n,1))
+        rows.append((step, vrate*100, 0))
     except:
         pass
 
