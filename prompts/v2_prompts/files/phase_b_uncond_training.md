@@ -74,9 +74,9 @@ Halt conditions:
 4. Read src/model/denoiser.py (verify d_model knob exists).
 5. State in Plan Artifact:
    - Architecture target: d_model=384, n_layers=16, n_heads=8, ~49M params
-   - Training: 200k steps, batch 64, lr 3e-4, from scratch
+   - Training: 150k steps, batch 64, lr 3e-4, from scratch
    - Validation: 100 unconditional scenes every 5k steps
-   - Phase B success: Drake validity > 5% uncond at step 200k
+   - Phase B success: Drake validity > 5% uncond at step 150k
    - Phase B halt: validity < 3% at step 100k
 
 # Phase B Execution
@@ -105,7 +105,7 @@ diffusion:
   n_inference_steps: 50
 
 training:
-  max_steps: 200000
+  max_steps: 150000
   batch_size: 64
   lr: 3e-4
   warmup_steps: 2000
@@ -229,11 +229,11 @@ run = wandb.init(
 artifact = wandb.Artifact(
     ARTIFACT_NAME,
     type="model",
-    description=f"v9 unconditional: 49M params, 234k data, 200k steps, from scratch. Trained {time.strftime('%Y-%m-%d')}.",
+    description=f"v9 unconditional: 49M params, 234k data, 150k steps, from scratch. Trained {time.strftime('%Y-%m-%d')}.",
     metadata={
         "params": "49M",
         "data_scenes": 234000,
-        "max_steps": 200000,
+        "max_steps": 150000,
         "batch_size": 64,
         "lr": 3e-4,
         "from_scratch": True,
@@ -395,7 +395,7 @@ echo ""
 echo "Configuration:"
 echo "  Model: 49M params (d_model=384, 16 layers, 8 heads)"
 echo "  Data: 234k scenes (train split)"
-echo "  Steps: 200,000"
+echo "  Steps: 150,000"
 echo "  Batch: 64"
 echo "  LR: 3e-4"
 echo "  Init: from scratch"

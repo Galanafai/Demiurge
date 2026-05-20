@@ -1,16 +1,15 @@
 """Diffusion noise schedule and DDIM sampler for the Demiurge model.
 
-Implements the cosine beta schedule from Nichol and Dhariwal (2021),
-"Improved Denoising Diffusion Probabilistic Models", and a DDIM sampler
-(Song et al. 2021) with a configurable number of inference steps.
+Implements the cosine beta schedule from Nichol and Dhariwal (2021) with
+optional zero terminal SNR rescaling (Lin et al. 2024) and v-parameterization
+(Salimans and Ho 2022, "Progressive Distillation").
 
 Conventions:
   - Timestep t is a 0-indexed integer in [0, T-1].
-  - alpha_bar_t (cumulative product of (1 - beta)) goes from near 1.0 at
-    t=0 to near 0.0 at t=T-1.
-  - x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * eps,
-    where eps ~ N(0, I) is the added noise.
-  - The model is trained to predict eps (noise prediction parameterisation).
+  - alpha_bar_t goes from near 1.0 at t=0 to 0.0 at t=T-1 (with zero SNR).
+  - x_t = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * eps.
+  - prediction_type='epsilon': model predicts eps (noise).
+  - prediction_type='v': model predicts v = sqrt(ab)*eps - sqrt(1-ab)*x0.
 """
 from __future__ import annotations
 
@@ -44,31 +43,43 @@ class CosineSchedule:
         T: int = 1000,
         s: float = 0.008,
         clip_beta_max: float = 0.999,
+        zero_terminal_snr: bool = False,
     ) -> None:
         self.T = T
         self.s = s
+        self.zero_terminal_snr = zero_terminal_snr
 
-        # Build alpha_bar for all t in [0, T] (T+1 values; index 0 is
-        # the "clean" state before any noise is added).
+        # Build alpha_bar for all t in [0, T] (T+1 values).
         t_all = torch.arange(T + 1, dtype=torch.float64)
         f = torch.cos(((t_all / T) + s) / (1.0 + s) * math.pi * 0.5) ** 2
         alpha_bar_raw = f / f[0]
 
-        # Derive betas and re-clip, then recompute alpha_bar from clipped betas
-        # to keep everything consistent.
         betas = 1.0 - alpha_bar_raw[1:] / alpha_bar_raw[:-1]
         betas = betas.clamp(0.0, clip_beta_max)
-
         alphas = 1.0 - betas
-        alpha_bar = torch.cumprod(alphas, dim=0)  # shape: (T,)
+        alpha_bar = torch.cumprod(alphas, dim=0)  # (T,)
 
-        # Prepend 1.0 so that alpha_bar_prev[0] = 1.0 (no noise at t=-1).
+        if zero_terminal_snr:
+            # Lin et al. 2024: rescale sqrt(alpha_bar) so the terminal value
+            # is exactly 0, enforcing SNR(T) = 0. This eliminates the signal
+            # leak bias where alpha_bar(T) ~= 1.6e-5 != 0.
+            sqrt_ab = alpha_bar.sqrt()                   # (T,)
+            sqrt_ab_0 = sqrt_ab[0].clone()
+            sqrt_ab_T = sqrt_ab[-1].clone()
+            # Shift so terminal = 0, then rescale so initial stays at sqrt_ab_0.
+            sqrt_ab = sqrt_ab - sqrt_ab_T
+            sqrt_ab = sqrt_ab * sqrt_ab_0 / (sqrt_ab_0 - sqrt_ab_T)
+            alpha_bar = sqrt_ab ** 2
+            # Recompute betas from rescaled alpha_bar for consistency.
+            alpha_bar_full = torch.cat([torch.ones(1, dtype=torch.float64), alpha_bar])
+            betas = 1.0 - alpha_bar_full[1:] / alpha_bar_full[:-1]
+            betas = betas.clamp(0.0, clip_beta_max)
+
         alpha_bar_prev = torch.cat([torch.ones(1, dtype=torch.float64), alpha_bar[:-1]])
 
-        # Store as float32 buffers. Register as plain tensors (no nn.Module).
-        self._alpha_bar: Tensor = alpha_bar.float()           # (T,)
-        self._alpha_bar_prev: Tensor = alpha_bar_prev.float() # (T,)
-        self._betas: Tensor = betas.float()                   # (T,)
+        self._alpha_bar: Tensor = alpha_bar.float()
+        self._alpha_bar_prev: Tensor = alpha_bar_prev.float()
+        self._betas: Tensor = betas.float()
         self._sqrt_alpha_bar: Tensor = alpha_bar.sqrt().float()
         self._sqrt_one_minus_alpha_bar: Tensor = (1.0 - alpha_bar).sqrt().float()
 
@@ -139,25 +150,43 @@ class CosineSchedule:
         return x_t, eps
 
     def predict_x0(self, x_t: Tensor, t: Tensor, eps_pred: Tensor) -> Tensor:
-        """Estimate x_0 from x_t and predicted noise eps_pred.
+        """Estimate x_0 from x_t and predicted noise eps_pred (epsilon parameterization)."""
+        extra_dims = x_t.dim() - 1
+        view_shape = (-1,) + (1,) * extra_dims
+        sqrt_ab   = self.sqrt_alpha_bar(t).view(view_shape).to(x_t.device)
+        sqrt_1mab = self.sqrt_one_minus_alpha_bar(t).view(view_shape).to(x_t.device)
+        return (x_t - sqrt_1mab * eps_pred) / sqrt_ab.clamp(min=1e-8)
 
-        x_0_pred = (x_t - sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_bar_t)
+    def predict_x0_from_v(self, x_t: Tensor, t: Tensor, v_pred: Tensor) -> Tensor:
+        """Estimate x_0 from x_t and predicted velocity v_pred (v parameterization).
 
-        Args:
-            x_t: Noisy sample at timestep t. Shape: (B, ...).
-            t: Integer timestep indices. Shape: (B,).
-            eps_pred: Predicted noise from denoiser. Shape: (B, ...).
-
-        Returns:
-            Estimated x_0. Shape: (B, ...).
+        v = sqrt(ab) * eps - sqrt(1-ab) * x0
+        => x0 = sqrt(ab) * x_t - sqrt(1-ab) * v
         """
         extra_dims = x_t.dim() - 1
         view_shape = (-1,) + (1,) * extra_dims
-
-        sqrt_ab = self.sqrt_alpha_bar(t).view(view_shape).to(x_t.device)
+        sqrt_ab   = self.sqrt_alpha_bar(t).view(view_shape).to(x_t.device)
         sqrt_1mab = self.sqrt_one_minus_alpha_bar(t).view(view_shape).to(x_t.device)
+        return sqrt_ab * x_t - sqrt_1mab * v_pred
 
-        return (x_t - sqrt_1mab * eps_pred) / sqrt_ab.clamp(min=1e-8)
+    def predict_eps_from_v(self, x_t: Tensor, t: Tensor, v_pred: Tensor) -> Tensor:
+        """Recover eps from x_t and v_pred: eps = sqrt(1-ab)*x_t + sqrt(ab)*v."""
+        extra_dims = x_t.dim() - 1
+        view_shape = (-1,) + (1,) * extra_dims
+        sqrt_ab   = self.sqrt_alpha_bar(t).view(view_shape).to(x_t.device)
+        sqrt_1mab = self.sqrt_one_minus_alpha_bar(t).view(view_shape).to(x_t.device)
+        return sqrt_1mab * x_t + sqrt_ab * v_pred
+
+    def compute_v_target(self, x0: Tensor, eps: Tensor, t: Tensor) -> Tensor:
+        """Compute ground-truth velocity target for v parameterization training.
+
+        v = sqrt(ab) * eps - sqrt(1-ab) * x0
+        """
+        extra_dims = x0.dim() - 1
+        view_shape = (-1,) + (1,) * extra_dims
+        sqrt_ab   = self.sqrt_alpha_bar(t).view(view_shape).to(x0.device)
+        sqrt_1mab = self.sqrt_one_minus_alpha_bar(t).view(view_shape).to(x0.device)
+        return sqrt_ab * eps - sqrt_1mab * x0
 
     def type_corruption_prob(self, t_idx: Tensor) -> Tensor:
         """Corruption probability for discrete type diffusion.
@@ -265,10 +294,17 @@ class DDIMSampler:
         schedule: CosineSchedule,
         n_steps: int = 50,
         eta: float = 0.0,
+        prediction_type: str = "epsilon",
     ) -> None:
+        """Args:
+            prediction_type: 'epsilon' (predict noise) or 'v' (predict velocity).
+        """
+        if prediction_type not in ("epsilon", "v"):
+            raise ValueError(f"prediction_type must be 'epsilon' or 'v', got {prediction_type!r}")
         self.schedule = schedule
         self.n_steps = n_steps
         self.eta = eta
+        self.prediction_type = prediction_type
 
         T = schedule.T
         # Select n_steps evenly-spaced timesteps from T-1 down to 0.
@@ -340,23 +376,21 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
-            # Predicted x_0.
-            # Clamp x0_pred to prevent explosion when ab_t is near zero
-            # (e.g. t=T-1 where alpha_bar ~ 5e-8 on the cosine schedule).
-            # Normalised scene values live in roughly [-2, 2]; the ±10 range
-            # is generous but prevents catastrophic amplification while still
-            # allowing the model to express the full dynamic range.
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            # Decode model output to x0 and eps depending on parameterization.
+            if self.prediction_type == "v":
+                x0_pred = sched.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_for_dir = sched.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+                eps_for_dir = eps_pred
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
-            # Direction pointing to x_t (eta=0 term is zero; kept for clarity).
             sigma = (
                 self.eta
                 * ((1.0 - ab_prev_v) / (1.0 - ab_t_v)).sqrt()
                 * (1.0 - ab_t_v / ab_prev_v).sqrt()
             )
-            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_pred
-
+            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_for_dir
             noise = sigma * torch.randn_like(x_t)
             x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
 
@@ -467,7 +501,12 @@ class DDIMSampler:
             ab_t_v = ab_t.view(view).to(device)
             ab_prev_v = ab_prev.view(view).to(device)
 
-            x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+            if self.prediction_type == "v":
+                x0_pred = sched.predict_x0_from_v(x_t, t_tensor, eps_pred)
+                eps_for_dir = sched.predict_eps_from_v(x_t, t_tensor, eps_pred)
+            else:
+                x0_pred = (x_t - (1.0 - ab_t_v).sqrt() * eps_pred) / ab_t_v.sqrt().clamp(min=1e-8)
+                eps_for_dir = eps_pred
             x0_pred = x0_pred.clamp(-10.0, 10.0)
 
             sigma = (
@@ -475,7 +514,7 @@ class DDIMSampler:
                 * ((1.0 - ab_prev_v) / (1.0 - ab_t_v)).sqrt()
                 * (1.0 - ab_t_v / ab_prev_v).sqrt()
             )
-            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_pred
+            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_for_dir
             noise = sigma * torch.randn_like(x_t)
             x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
 
