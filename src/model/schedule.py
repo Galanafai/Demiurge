@@ -428,7 +428,7 @@ class DDIMSampler:
                 * ((1.0 - ab_prev_v) / (1.0 - ab_t_v)).sqrt()
                 * (1.0 - ab_t_v / ab_prev_v).sqrt()
             )
-            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_for_dir
+            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_pred
             noise = sigma * torch.randn_like(x_t)
             x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
 
@@ -553,7 +553,7 @@ class DDIMSampler:
                 * ((1.0 - ab_prev_v) / (1.0 - ab_t_v)).sqrt()
                 * (1.0 - ab_t_v / ab_prev_v).sqrt()
             )
-            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_for_dir
+            dir_xt = (1.0 - ab_prev_v - sigma ** 2).clamp(min=0.0).sqrt() * eps_pred
             noise = sigma * torch.randn_like(x_t)
             x_t = ab_prev_v.sqrt() * x0_pred + dir_xt + noise
 
