@@ -1,0 +1,44 @@
+[Tue May 19 19:42:21 UTC 2026] Waiting for checkpoints/v9_uncond_v6/step_00060000.pt...
+[Tue May 19 19:42:21 UTC 2026] Waiting for checkpoints/v9_uncond_v6/step_00100000.pt...
+[Tue May 19 19:54:21 UTC 2026] Checkpoint found. Running Drake probe...
+Loaded EMA from checkpoints/v9_uncond_v6/step_00060000.pt (step=60000)
+Text mode: none (unconditional)
+Sampling 200 scenes ...
+Sampling done in 9.5s. Running Drake validation ...
+
+=== Drake Probe Results ===
+  Text mode:       none
+  Head:            EMA
+  Step:            60000
+  N scenes:        200
+  Accepted:        0 (0.0%)
+  Rejected:        200
+    interpenetration    :  146 (73.0%)
+    ik_unreachable      :   54 (27.0%)
+  Sample elapsed:  9.5s
+  Drake elapsed:   2.0s (6 workers)
+  Total elapsed:   11.5s (0.06s/scene)
+  Validity rate:   0.0000
+  Results written to artifacts/v6_probe_60000.json
+[Tue May 19 19:54:35 UTC 2026] Probe complete: artifacts/v6_probe_60000.json
+[Tue May 19 20:45:51 UTC 2026] Checkpoint found. Running Drake probe...
+Loaded EMA from checkpoints/v9_uncond_v6/step_00100000.pt (step=100000)
+Text mode: none (unconditional)
+Sampling 200 scenes ...
+Sampling done in 9.5s. Running Drake validation ...
+
+=== Drake Probe Results ===
+  Text mode:       none
+  Head:            EMA
+  Step:            100000
+  N scenes:        200
+  Accepted:        0 (0.0%)
+  Rejected:        200
+    ik_unreachable      :  185 (92.5%)
+    interpenetration    :   15 (7.5%)
+  Sample elapsed:  9.5s
+  Drake elapsed:   2.9s (6 workers)
+  Total elapsed:   12.3s (0.06s/scene)
+  Validity rate:   0.0000
+  Results written to artifacts/v6_probe_100000.json
+[Tue May 19 20:46:06 UTC 2026] Probe complete: artifacts/v6_probe_100000.json

@@ -709,7 +709,7 @@ def main() -> None:
             if torch.rand(1, generator=_cfg_rng).item() < cfg_dropout
         )
         _actual_rate = _null_count / 1000
-        _lo, _hi = 0.13, 0.17
+        _lo, _hi = cfg_dropout * 0.7, cfg_dropout * 1.3
         if not (_lo <= _actual_rate <= _hi):
             raise RuntimeError(
                 f"CFG dropout smoke test FAILED: rate={_actual_rate:.3f} outside [{_lo}, {_hi}]. "

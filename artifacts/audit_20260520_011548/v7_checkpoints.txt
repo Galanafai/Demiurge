@@ -1,0 +1,16 @@
+total 11G
+-rw-r--r-- 1 root root 743M May 20 01:06 latest.pt
+-rw-r--r-- 1 root root 743M May 19 22:19 step_00010000.pt
+-rw-r--r-- 1 root root 743M May 19 22:31 step_00020000.pt
+-rw-r--r-- 1 root root 743M May 19 22:44 step_00030000.pt
+-rw-r--r-- 1 root root 743M May 19 22:57 step_00040000.pt
+-rw-r--r-- 1 root root 743M May 19 23:10 step_00050000.pt
+-rw-r--r-- 1 root root 743M May 19 23:23 step_00060000.pt
+-rw-r--r-- 1 root root 743M May 19 23:36 step_00070000.pt
+-rw-r--r-- 1 root root 743M May 19 23:48 step_00080000.pt
+-rw-r--r-- 1 root root 743M May 20 00:01 step_00090000.pt
+-rw-r--r-- 1 root root 743M May 20 00:14 step_00100000.pt
+-rw-r--r-- 1 root root 743M May 20 00:27 step_00110000.pt
+-rw-r--r-- 1 root root 743M May 20 00:40 step_00120000.pt
+-rw-r--r-- 1 root root 743M May 20 00:53 step_00130000.pt
+-rw-r--r-- 1 root root 743M May 20 01:06 step_00140000.pt
