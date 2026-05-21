@@ -1,0 +1,2 @@
+{"guidance_scale": 0.0, "seed": 42, "n_scenes": 200, "non_empty": 97, "accepted": 0, "validity_rate": 0.0, "interp_pass": 90, "stable_pass": 6, "ik_pass": 74, "rrt_pass": 17}
+{"guidance_scale": 2.0, "seed": 42, "n_scenes": 200, "non_empty": 97, "accepted": 0, "validity_rate": 0.0, "interp_pass": 90, "stable_pass": 6, "ik_pass": 74, "rrt_pass": 17}
