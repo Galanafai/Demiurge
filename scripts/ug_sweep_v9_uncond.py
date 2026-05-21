@@ -98,62 +98,67 @@ def sample_with_ug(
             x0 = sampler.sample(fn, (batch_size, N_MAX, 13), seed=seed, device=device)
         return x0
     
-    # UG path: manual DDIM loop
+    # UG path: manual DDIM loop.
+    # NOTE: CosineSchedule with zero_terminal_snr=True gives alpha_bar=0 at t=T-1.
+    # Any Tweedie x0_hat = (x - sigma * eps) / sqrt(alpha_bar) is undefined (div by 0)
+    # at those steps. We guard with alpha_min and skip UG there.
     if seed is not None:
         gen = torch.Generator(device=device).manual_seed(seed)
     else:
         gen = None
-    
+
     x = torch.randn(batch_size, N_MAX, 13, device=device, generator=gen)
     sched = sampler.schedule
     timesteps = sampler._timesteps
     n_steps = len(timesteps)
     guide_start = int(0.1 * n_steps)
     guide_end   = int(0.9 * n_steps)
-    
-    # Dummy type_ids for energy (not used in presence gate computation)
+    ALPHA_MIN   = 1e-4  # below this, Tweedie x0 is undefined; skip UG and use fallback step
+
     type_ids_dummy = torch.zeros(batch_size, N_MAX, dtype=torch.long, device=device)
-    
+
     for i, t_val in enumerate(timesteps):
         t_tensor = torch.full((batch_size,), t_val, dtype=torch.long, device=device)
         alpha_bar = sched.alpha_bar(t_tensor).to(device).view(batch_size, 1, 1)
         sigma_bar = (1.0 - alpha_bar).sqrt()
-        
+
         with torch.no_grad():
-            # noise_prediction_fn returns (eps, type_logits) or just eps
-            out = fn(x, t_tensor, None)  # noise_prediction_fn takes (x_t, t, _text_emb)
-            if isinstance(out, tuple):
-                eps_pred = out[0]
-            else:
-                eps_pred = out
-        
-        # Tweedie: x0_hat = (x - sigma * eps) / alpha
-        x0_hat = (x - sigma_bar * eps_pred) / alpha_bar.sqrt()
-        
-        # UG: apply energy gradient to x0_hat in guidance window
-        if guide_start <= i < guide_end:
+            out = fn(x, t_tensor, None)  # noise_prediction_fn(x_t, t, _text_emb) -> eps
+            eps_pred = out[0] if isinstance(out, tuple) else out
+
+        # Compute UG guidance only when Tweedie estimate is numerically valid
+        eps_guided = eps_pred
+        a_scalar = float(alpha_bar[0, 0, 0])
+        if guide_start <= i < guide_end and a_scalar > ALPHA_MIN:
+            x0_hat = (x - sigma_bar * eps_pred) / alpha_bar.sqrt()
             x0_g = x0_hat.detach().clone().requires_grad_(True)
             energy = pairwise_overlap_energy(x0_g, type_ids_dummy, presence_threshold)
             grad = torch.autograd.grad(energy.sum(), x0_g)[0]
+            grad[:, :, 12] = 0.0  # FIX: presence_logit (ch12) must not be guided
             grad_norm = grad.abs().max()
             if grad_norm > 1e-8:
-                grad = grad / grad_norm  # normalize to unit L-inf
+                grad = grad / grad_norm  # L-inf normalize
             eps_guided = eps_pred - guidance_scale * sigma_bar * grad.detach()
-        else:
-            eps_guided = eps_pred
-        
-        # DDIM step
+
+        # DDIM step -- use Tweedie form when alpha is safe, else eps-only fallback
         if i < n_steps - 1:
             t_next = timesteps[i + 1]
             t_next_t = torch.full((batch_size,), t_next, dtype=torch.long, device=device)
             alpha_bar_next = sched.alpha_bar(t_next_t).to(device).view(batch_size, 1, 1)
             sigma_bar_next = (1.0 - alpha_bar_next).sqrt()
-            x0_ddim = (x - sigma_bar * eps_guided) / alpha_bar.sqrt()
-            x = alpha_bar_next.sqrt() * x0_ddim + sigma_bar_next * eps_guided
+            if a_scalar > ALPHA_MIN:
+                x0_ddim = (x - sigma_bar * eps_guided) / alpha_bar.sqrt()
+                x = alpha_bar_next.sqrt() * x0_ddim + sigma_bar_next * eps_guided
+            else:
+                # Pure eps step: x_{t-1} = x_t - sigma_bar * eps_guided (ignoring x0 term)
+                # This is only hit at t=999 (i=0) with zero_terminal_snr.
+                x = x - (sigma_bar - sigma_bar_next) * eps_guided
         else:
-            x0_final = (x - sigma_bar * eps_guided) / alpha_bar.sqrt()
-            x = x0_final
-    
+            # Final step: return x0 estimate
+            if a_scalar > ALPHA_MIN:
+                x = (x - sigma_bar * eps_guided) / alpha_bar.sqrt()
+            # else: x already close to x0 at near-zero sigma
+
     return x.detach()
 
 
