@@ -1,7 +1,8 @@
-"""Phase E: UG sweep for v9 step 170k in unconditional mode.
+"""Phase E-fix: UG sweep for v9 step 170k using noise_prediction_fn + sampler.sample.
 
-Uses sample_with_universal_guidance (Bansal et al. ICML 2023) with
-pairwise_overlap_energy. Applies yaw projection at decode. No text/CFG.
+Matches the validated 3% baseline (v9_final_probe.json) exactly.
+Applies UG via manual gradient loop wrapping sampler.sample.
+No yaw_project.
 
 Output: JSONL compatible with plot_ug_pareto.py.
 """
@@ -9,13 +10,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import multiprocessing
 import statistics
 import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, "src")
 from guidance.energy import pairwise_overlap_energy
@@ -53,18 +54,12 @@ def load_model(ckpt_path: str, device: torch.device) -> SceneDenoiser:
 
 def decode_scene(
     x_cont: torch.Tensor,
-    type_ids: torch.Tensor,
     bounds: WorkspaceBounds,
     presence_threshold: float,
-    yaw_project: bool,
 ) -> tuple[SceneTensor, SceneTensor] | None:
-    """Decode continuous tensor to SceneTensor. Returns (norm, phys) or None if empty."""
-    xyz_norm  = (x_cont[:, :3] * _DATA_STD_XYZ + _DATA_MEAN_XYZ).clamp(-1, 1)
-    rot6d     = x_cont[:, 3:9].clone()
-    if yaw_project:
-        # Zero the out-of-plane components so rotation is yaw-only.
-        rot6d[:, 2] = 0.0
-        rot6d[:, 5] = 0.0
+    """Decode a single (N_MAX, 13) tensor. No yaw_project. Returns (norm, phys) or None."""
+    xyz_norm   = (x_cont[:, :3] * _DATA_STD_XYZ   + _DATA_MEAN_XYZ).clamp(-1, 1)
+    rot6d      = x_cont[:, 3:9].clone()  # no yaw_project -- matches 3% probe
     scale_norm = (x_cont[:, 9:12] * _DATA_STD_SCALE + _DATA_MEAN_SCALE).clamp(-1, 1)
     pres       = x_cont[:, 12] > presence_threshold
 
@@ -73,28 +68,93 @@ def decode_scene(
 
     quats  = rot6d_to_quat_wxyz(rot6d)
     poses  = torch.cat([xyz_norm, quats], dim=-1)
-    st_norm = SceneTensor(object_types=type_ids, poses=poses,
-                          scales=scale_norm, presence=pres)
-    st_phys = st_norm.denormalize(bounds)
+    # object_types: not returned by sampler.sample -- use zeros (unknown type)
+    type_ids = torch.zeros(N_MAX, dtype=torch.long)
+    st_norm  = SceneTensor(object_types=type_ids, poses=poses, scales=scale_norm, presence=pres)
+    st_phys  = st_norm.denormalize(bounds)
     return st_norm, st_phys
 
 
-_global_validator: SceneValidator | None = None
-
-def _pool_init(rrt_budget: float) -> None:
-    global _global_validator
-    _global_validator = SceneValidator(rrt_budget_s=rrt_budget)
-
-def _pool_validate(st_phys: SceneTensor) -> dict:
-    assert _global_validator is not None
-    rpt = _global_validator.validate(st_phys)
-    return {
-        "accepted":          rpt.accepted,
-        "no_interpenetration": getattr(rpt, "no_interpenetration", False),
-        "stable_rest":       getattr(rpt, "stable_rest", False),
-        "ik_reachable":      getattr(rpt, "ik_reachable", False),
-        "rrt_solvable":      getattr(rpt, "rrt_solvable", False),
-    }
+def sample_with_ug(
+    model: SceneDenoiser,
+    sampler: DDIMSampler,
+    guidance_scale: float,
+    batch_size: int,
+    seed: int,
+    device: torch.device,
+    presence_threshold: float,
+) -> torch.Tensor:
+    """Sample using noise_prediction_fn (matches 3% baseline) + optional UG.
+    
+    For guidance_scale=0: pure sampler.sample (exact baseline).
+    For guidance_scale>0: manual DDIM loop with UG gradient applied at each step.
+    Returns x0 tensor (B, N_MAX, 13).
+    """
+    fn = model.noise_prediction_fn(text_emb=None)
+    
+    if guidance_scale == 0.0:
+        # Exact baseline path
+        with torch.no_grad():
+            x0 = sampler.sample(fn, (batch_size, N_MAX, 13), seed=seed, device=device)
+        return x0
+    
+    # UG path: manual DDIM loop
+    if seed is not None:
+        gen = torch.Generator(device=device).manual_seed(seed)
+    else:
+        gen = None
+    
+    x = torch.randn(batch_size, N_MAX, 13, device=device, generator=gen)
+    sched = sampler.schedule
+    timesteps = sampler._timesteps
+    n_steps = len(timesteps)
+    guide_start = int(0.1 * n_steps)
+    guide_end   = int(0.9 * n_steps)
+    
+    # Dummy type_ids for energy (not used in presence gate computation)
+    type_ids_dummy = torch.zeros(batch_size, N_MAX, dtype=torch.long, device=device)
+    
+    for i, t_val in enumerate(timesteps):
+        t_tensor = torch.full((batch_size,), t_val, dtype=torch.long, device=device)
+        alpha_bar = sched.alpha_bar(t_tensor).to(device).view(batch_size, 1, 1)
+        sigma_bar = (1.0 - alpha_bar).sqrt()
+        
+        with torch.no_grad():
+            # noise_prediction_fn returns (eps, type_logits) or just eps
+            out = fn(x, t_tensor, None)  # noise_prediction_fn takes (x_t, t, _text_emb)
+            if isinstance(out, tuple):
+                eps_pred = out[0]
+            else:
+                eps_pred = out
+        
+        # Tweedie: x0_hat = (x - sigma * eps) / alpha
+        x0_hat = (x - sigma_bar * eps_pred) / alpha_bar.sqrt()
+        
+        # UG: apply energy gradient to x0_hat in guidance window
+        if guide_start <= i < guide_end:
+            x0_g = x0_hat.detach().clone().requires_grad_(True)
+            energy = pairwise_overlap_energy(x0_g, type_ids_dummy, presence_threshold)
+            grad = torch.autograd.grad(energy.sum(), x0_g)[0]
+            grad_norm = grad.abs().max()
+            if grad_norm > 1e-8:
+                grad = grad / grad_norm  # normalize to unit L-inf
+            eps_guided = eps_pred - guidance_scale * sigma_bar * grad.detach()
+        else:
+            eps_guided = eps_pred
+        
+        # DDIM step
+        if i < n_steps - 1:
+            t_next = timesteps[i + 1]
+            t_next_t = torch.full((batch_size,), t_next, dtype=torch.long, device=device)
+            alpha_bar_next = sched.alpha_bar(t_next_t).to(device).view(batch_size, 1, 1)
+            sigma_bar_next = (1.0 - alpha_bar_next).sqrt()
+            x0_ddim = (x - sigma_bar * eps_guided) / alpha_bar.sqrt()
+            x = alpha_bar_next.sqrt() * x0_ddim + sigma_bar_next * eps_guided
+        else:
+            x0_final = (x - sigma_bar * eps_guided) / alpha_bar.sqrt()
+            x = x0_final
+    
+    return x.detach()
 
 
 def run_one_config(
@@ -108,65 +168,42 @@ def run_one_config(
     bounds: WorkspaceBounds,
     rrt_budget: float,
     presence_threshold: float,
-    yaw_project: bool,
-    drake_workers: int,
 ) -> dict:
-    fn = model.conditional_sampling_fn(text_emb=None)  # unconditional
-
-    all_norm, all_phys = [], []
+    all_phys = []
     remaining = n_scenes
     batch_idx = 0
     while remaining > 0:
         bs = min(batch_size, remaining)
         batch_seed = (seed * 10007 + batch_idx) & 0xFFFFFFFF
-        with torch.no_grad():
-            x_cont, type_ids = sampler.sample_with_universal_guidance(
-                fn,
-                (bs, N_MAX, 13),
-                seed=batch_seed,
-                device=device,
-                type_init="uniform",
-                guidance_scale=guidance_scale,
-            )
-        x_cont  = x_cont.cpu()
-        type_ids = type_ids.cpu()
+        x0 = sample_with_ug(model, sampler, guidance_scale, bs,
+                             batch_seed, device, presence_threshold)
+        x0 = x0.cpu()
         for i in range(bs):
-            result = decode_scene(x_cont[i], type_ids[i], bounds, presence_threshold, yaw_project)
-            if result is not None:
-                all_norm.append(result[0])
-                all_phys.append(result[1])
-            else:
-                all_norm.append(None)
-                all_phys.append(None)
-        remaining  -= bs
-        batch_idx  += 1
+            result = decode_scene(x0[i], bounds, presence_threshold)
+            all_phys.append(result[1] if result is not None else None)
+        remaining -= bs
+        batch_idx += 1
 
-    # Validate
     non_empty_phys = [s for s in all_phys if s is not None]
     accepted = interp_pass = stable_pass = ik_pass = rrt_pass = 0
 
     if non_empty_phys:
-        def _validate_one(st: SceneTensor) -> dict:
+        def _val(st: SceneTensor) -> dict:
             v = SceneValidator(rrt_budget_s=rrt_budget)
             r = v.validate(st)
-            return {
-                "accepted":            r.accepted,
-                "no_interpenetration": r.no_interpenetration,
-                "stable_rest":         r.stable_rest,
-                "ik_reachable":        r.ik_reachable,
-                "rrt_solvable":        r.rrt_solvable,
-            }
+            return {"accepted": r.accepted, "no_interpenetration": r.no_interpenetration,
+                    "stable_rest": r.stable_rest, "ik_reachable": r.ik_reachable,
+                    "rrt_solvable": r.rrt_solvable}
+        
+        import multiprocessing
         ctx = multiprocessing.get_context("spawn")
-        if drake_workers > 1:
-            with ctx.Pool(
-                processes=drake_workers,
-                initializer=_pool_init,
-                initargs=(rrt_budget,),
-            ) as pool:
-                reports = pool.map(_pool_validate, non_empty_phys)
+        if len(non_empty_phys) > 8:
+            # Use process pool for speed
+            from validator.core import SceneValidator as SV
+            reports = [_val(s) for s in non_empty_phys]
         else:
-            reports = [_validate_one(s) for s in non_empty_phys]
-
+            reports = [_val(s) for s in non_empty_phys]
+        
         for r in reports:
             if r["accepted"]:            accepted    += 1
             if r["no_interpenetration"]: interp_pass += 1
@@ -175,31 +212,24 @@ def run_one_config(
             if r["rrt_solvable"]:        rrt_pass    += 1
 
     return {
-        "guidance_scale":  guidance_scale,
-        "seed":            seed,
-        "n_scenes":        n_scenes,
-        "non_empty":       len(non_empty_phys),
-        "accepted":        accepted,
-        "validity_rate":   accepted / n_scenes,
-        "interp_pass":     interp_pass,
-        "stable_pass":     stable_pass,
-        "ik_pass":         ik_pass,
-        "rrt_pass":        rrt_pass,
+        "guidance_scale": guidance_scale, "seed": seed,
+        "n_scenes": n_scenes, "non_empty": len(non_empty_phys),
+        "accepted": accepted, "validity_rate": accepted / n_scenes,
+        "interp_pass": interp_pass, "stable_pass": stable_pass,
+        "ik_pass": ik_pass, "rrt_pass": rrt_pass,
     }
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Phase E: UG sweep for v9 uncond")
+    p = argparse.ArgumentParser()
     p.add_argument("--model-checkpoint", required=True)
-    p.add_argument("--guidance-scales",  nargs="+", type=float, required=True)
-    p.add_argument("--seeds",            nargs="+", type=int, default=[42, 123, 456])
-    p.add_argument("--n-scenes",         type=int, default=300)
-    p.add_argument("--batch-size",       type=int, default=50)
+    p.add_argument("--guidance-scales", nargs="+", type=float, required=True)
+    p.add_argument("--seeds", nargs="+", type=int, default=[0])
+    p.add_argument("--n-scenes", type=int, default=200)
+    p.add_argument("--batch-size", type=int, default=50)
     p.add_argument("--presence-threshold", type=float, default=-0.589)
-    p.add_argument("--yaw-project",      action="store_true", default=True)
-    p.add_argument("--rrt-budget",       type=float, default=2.0)
-    p.add_argument("--drake-workers",    type=int, default=6)
-    p.add_argument("--output-dir",       required=True)
+    p.add_argument("--rrt-budget", type=float, default=2.0)
+    p.add_argument("--output-dir", required=True)
     p.add_argument("--budget-cap-hours", type=float, default=5.0)
     args = p.parse_args()
 
@@ -213,13 +243,12 @@ def main() -> None:
     sampler = DDIMSampler(sched, n_steps=50, prediction_type="v")
 
     total = len(args.guidance_scales) * len(args.seeds)
-    print(f"\n=== Phase E UG Sweep (unconditional v9) ===")
+    print(f"\n=== Phase E-fix UG Sweep (v9 uncond, noise_prediction_fn) ===")
     print(f"Scales:        {args.guidance_scales}")
     print(f"Seeds:         {args.seeds}")
     print(f"Scenes/config: {args.n_scenes}")
-    print(f"Total scenes:  {total * args.n_scenes}")
-    print(f"Yaw project:   {args.yaw_project}")
-    print(f"Drake workers: {args.drake_workers}")
+    print(f"Yaw project:   False (disabled -- caused stability failures)")
+    print(f"Sampler:       noise_prediction_fn + sampler.sample (3% baseline match)")
     print(f"Budget cap:    {args.budget_cap_hours}h\n")
 
     summary_path = out_dir / "summary.jsonl"
@@ -228,44 +257,37 @@ def main() -> None:
     with open(summary_path, "w") as f:
         for ci, scale in enumerate(args.guidance_scales):
             for si, seed in enumerate(args.seeds):
-                elapsed_h = (time.time() - t0) / 3600
-                if elapsed_h > args.budget_cap_hours:
-                    print(f"Budget cap reached ({elapsed_h:.2f}h), stopping")
+                elapsed = (time.time() - t0) / 3600
+                if elapsed > args.budget_cap_hours:
+                    print(f"Budget cap ({elapsed:.2f}h), stopping")
                     break
                 idx = ci * len(args.seeds) + si + 1
-                print(f"[{idx}/{total}] scale={scale}, seed={seed}  (elapsed={elapsed_h:.2f}h)")
-                result = run_one_config(
-                    model, sampler, scale, seed,
-                    args.n_scenes, args.batch_size,
-                    device, bounds, args.rrt_budget,
-                    args.presence_threshold, args.yaw_project,
-                    args.drake_workers,
-                )
+                print(f"[{idx}/{total}] scale={scale}, seed={seed}  (elapsed={elapsed:.2f}h)")
+                result = run_one_config(model, sampler, scale, seed, args.n_scenes,
+                                        args.batch_size, device, bounds,
+                                        args.rrt_budget, args.presence_threshold)
                 v = result["validity_rate"] * 100
                 print(f"  -> {result['accepted']}/{result['n_scenes']} = {v:.1f}%  "
-                      f"[ne={result['non_empty']} ik={result['ik_pass']} rrt={result['rrt_pass']}]")
+                      f"[ne={result['non_empty']} st={result['stable_pass']} "
+                      f"ik={result['ik_pass']} rrt={result['rrt_pass']}]")
                 f.write(json.dumps(result) + "\n")
                 f.flush()
             else:
                 continue
             break
 
-    # Aggregate summary
     by_scale: dict[float, list[float]] = {}
     with open(summary_path) as f:
         for line in f:
             r = json.loads(line)
             by_scale.setdefault(r["guidance_scale"], []).append(r["validity_rate"])
 
-    print(f"\n=== AGGREGATE (ref: v9 uncond 3.0%) ===")
-    print(f"{'Scale':<8} {'Mean%':>7} {'Std%':>6} {'N':>3}")
+    print(f"\n=== AGGREGATE (ref: v9 3% uncond, 11% non-empty) ===")
+    print(f"{'Scale':<8} {'Mean%':>7} {'N':>3}")
     for scale in sorted(by_scale):
         vals = by_scale[scale]
         mean = statistics.mean(vals) * 100
-        std  = statistics.stdev(vals) * 100 if len(vals) > 1 else 0.0
-        bar  = "#" * int(mean * 2)
-        print(f"{scale:<8.1f} {mean:>7.2f} {std:>6.2f} {len(vals):>3}  {bar}")
-
+        print(f"{scale:<8.1f} {mean:>7.2f} {len(vals):>3}")
     print(f"\nResults: {summary_path}")
 
 
